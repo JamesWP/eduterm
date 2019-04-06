@@ -392,7 +392,7 @@ int atoi_range(char* buf, size_t len, int def)
     return s;
 }
 
-void process_csi(char *buf, size_t len, struct X11 *x11)
+void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
 {
     char op = buf[len];
 
@@ -401,7 +401,6 @@ void process_csi(char *buf, size_t len, struct X11 *x11)
     char * const lstart = x11->buf + x11->buf_w * x11->buf_y;
     char * const cursor = lstart + x11->buf_x;
     char * const lend   = lstart + x11->buf_w - 1;
-
 
     switch (op) {
       case '@': {
@@ -412,7 +411,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11)
         //                   bend
         //  insert 2 : |---c123456|
         //             |---__c1234|
-        int num = atoi_range(buf, len-1, 1);
+        int num = atoi_range(buf, len - 1, 1);
         for (char *source = lend - num, *dest = lend; source >= cursor;
              --dest, --source)
             *dest = *source;
@@ -427,17 +426,69 @@ void process_csi(char *buf, size_t len, struct X11 *x11)
         for (char *source = cursor + num, *dest = cursor; source != lend + 1;
              ++source, ++dest)
             *dest = *source;
-        
+
       } break;
       case 'm': {
         // SGR - Select Graphic Rendition
-        int arg1 = atoi_range(buf, len-1, 0);
+        int arg1 = atoi_range(buf, len - 1, 0);
         if (arg1 == 0) {
             // reset
         }
       } break;
+      case 'h':
+      case 'r':
+      case 'l': {
+        // Ignored
+      } break;
+      case 'J': {
+        int arg1;
+        sscanf(buf, "%dJ", &arg1);
+        if (arg1 == 2) {
+            for (char *a = x11->buf; a != x11->buf + x11->buf_w * x11->buf_h;
+                 ++a)
+                *a = ' ';
+            x11->buf_x = 0;
+            x11->buf_y = 0;
+        }
+        else {
+            exit(1);
+        }
+      } break;
+      case 'c': {
+        if (buf[0] == '>') {
+            int  num = 10;
+            char send[num];
+            send[0] = (char)27;
+            send[1] = '[';
+            send[2] = '>';
+            send[3] = '1';
+            send[4] = ';';
+            send[5] = '9';
+            send[6] = '5';
+            send[7] = ';';
+            send[8] = '0';
+            send[9] = 'c';
+            for (int i = 0; i < num; i++)
+                write(pty->master, &send[i], 1);
+        }
+        else {
+            exit(1);
+        }
+      } break;
+      case 'C': {
+        int arg1;
+        sscanf(buf, "%dC", &arg1);
+        x11->buf_x += arg1;
+        x11->buf_x = x11->buf_x < x11->buf_w - 1 ? x11->buf_x : x11->buf_w - 1;
+      } break;
+      case 'H': {
+        int r, c;
+        sscanf(buf, "%d;%dH", &r, &c);
+        x11->buf_x = c - 1;
+        x11->buf_y = r - 1;
+      } break;
       default: {
-        *(int *)(0x0) = 0;
+        exit(1);
       } break;
     }
 }
@@ -522,7 +573,7 @@ int run(struct PTY *pty, struct X11 *x11)
                 csi_buf_i++;
                 if (is_final_csi_byte(buf[0])) {
                     csi_buf[csi_buf_i] = '\0';
-                    process_csi(csi_buf, csi_buf_i - 1, x11);
+                    process_csi(csi_buf, csi_buf_i - 1, x11, pty);
                     read_csi = false;
                 }
             }
