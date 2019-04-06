@@ -11,8 +11,8 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -178,7 +178,7 @@ void x11_key(XKeyEvent *ev, struct PTY *pty)
     }
     else if (IsKeypad(ksym) != '\0') {
         printf("XKeyEvent arrow key\n");
-        num = 3;
+        num    = 3;
         buf[0] = (char)27;
         buf[1] = '[';
         buf[2] = IsKeypad(ksym);
@@ -216,8 +216,6 @@ void x11_redraw(struct X11 *x11)
                    x11->buf_y * x11->font_height,
                    x11->font_width,
                    x11->font_height);
-
-
 
     XSetForeground(x11->dpy, x11->termgc, x11->col_fg);
     for (y = 0; y < x11->buf_h; y++) {
@@ -260,8 +258,8 @@ bool x11_setup(struct X11 *x11)
     x11->root   = RootWindow(x11->dpy, x11->screen);
     x11->fd     = ConnectionNumber(x11->dpy);
 
-    const char* font;
-    
+    const char *font;
+
     font = "-*-fixed-medium-*-normal-*-*-140-*-*-*-90-*-";
     font = "fixed";
     font = "12x24";
@@ -365,7 +363,7 @@ bool spawn(struct PTY *pty)
         dup2(pty->slave, 1);
         dup2(pty->slave, 2);
         close(pty->slave);
-    
+
         putenv("TERM=xterm-256color");
 
         execle(SHELL, "-" SHELL, NULL, env);
@@ -385,6 +383,65 @@ bool is_final_csi_byte(char b)
     return b >= 0x40 && b <= 0x73;
 }
 
+int atoi_range(char* buf, size_t len, int def)
+{
+    int  s = def;
+    if (len >= 1) {
+        s = atoi(buf);
+    }
+    return s;
+}
+
+void process_csi(char *buf, size_t len, struct X11 *x11)
+{
+    char op = buf[len];
+
+    printf("Processing CSI '%s' op %c\n", buf, op);
+
+    char * const lstart = x11->buf + x11->buf_w * x11->buf_y;
+    char * const cursor = lstart + x11->buf_x;
+    char * const lend   = lstart + x11->buf_w - 1;
+
+
+    switch (op) {
+      case '@': {
+        // insert character into line
+        //             lstart
+        //                 cursor
+        //                        lend
+        //                   bend
+        //  insert 2 : |---c123456|
+        //             |---__c1234|
+        int num = atoi_range(buf, len-1, 1);
+        for (char *source = lend - num, *dest = lend; source >= cursor;
+             --dest, --source)
+            *dest = *source;
+
+        for (char *bend = cursor + num - 1; bend != cursor - 1; --bend)
+            *bend = ' ';
+
+      } break;
+      case 'P': {
+        // Delete characters
+        int num = atoi_range(buf, len - 1, 1);
+        for (char *source = cursor + num, *dest = cursor; source != lend + 1;
+             ++source, ++dest)
+            *dest = *source;
+        
+      } break;
+      case 'm': {
+        // SGR - Select Graphic Rendition
+        int arg1 = atoi_range(buf, len-1, 0);
+        if (arg1 == 0) {
+            // reset
+        }
+      } break;
+      default: {
+        *(int *)(0x0) = 0;
+      } break;
+    }
+}
+
 int run(struct PTY *pty, struct X11 *x11)
 {
     int    i, maxfd;
@@ -392,9 +449,12 @@ int run(struct PTY *pty, struct X11 *x11)
     fd_set readable;
     XEvent ev;
     char   buf[1];
-    bool   just_wrapped = false;
+    bool   just_wrapped     = false;
     bool   read_escape_mode = false;
     bool   read_csi         = false;
+
+    char   csi_buf[20];
+    size_t csi_buf_i;
 
     struct timeval timeout;
 
@@ -408,7 +468,7 @@ int run(struct PTY *pty, struct X11 *x11)
     for (;;) {
         readable = active;
 
-        timeout.tv_sec = 0;
+        timeout.tv_sec  = 0;
         timeout.tv_usec = 1000000;
 
         int num = select(maxfd + 1, &readable, NULL, NULL, &timeout);
@@ -449,7 +509,8 @@ int run(struct PTY *pty, struct X11 *x11)
                 read_escape_mode = false;
                 switch (buf[0]) {
                   case '[':
-                    read_csi = true;
+                    read_csi  = true;
+                    csi_buf_i = 0;
                     printf("Escape code csi\n");
                     break;
                   default:
@@ -457,7 +518,11 @@ int run(struct PTY *pty, struct X11 *x11)
                 }
             }
             else if (read_csi) {
+                csi_buf[csi_buf_i] = buf[0];
+                csi_buf_i++;
                 if (is_final_csi_byte(buf[0])) {
+                    csi_buf[csi_buf_i] = '\0';
+                    process_csi(csi_buf, csi_buf_i - 1, x11);
                     read_csi = false;
                 }
             }
@@ -501,7 +566,7 @@ int run(struct PTY *pty, struct X11 *x11)
                             perror(NULL);
                             return 1;
                         }
-                        
+
                         buf[0] = '%';
                     }
 

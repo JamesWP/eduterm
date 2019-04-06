@@ -1,5 +1,5 @@
 LDLIBS += -lX11
-CFLAGS += -std=c99 -Wall -Wextra
+CFLAGS += -std=c99 -Wall -Wextra -g 
 
 .PHONY: all clean
 
