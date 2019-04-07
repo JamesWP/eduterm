@@ -44,6 +44,8 @@ struct X11 {
     int   buf_w, buf_h;
     int   buf_x, buf_y;
     bool  blink;
+
+    int scr_begin, scr_end;
 };
 
 bool term_set_size(struct PTY *pty, struct X11 *x11)
@@ -308,6 +310,9 @@ bool x11_setup(struct X11 *x11)
         return false;
     }
 
+    x11->scr_begin = 0;
+    x11->scr_end   = x11->buf_h - 1;
+
     x11->w = x11->buf_w * x11->font_width;
     x11->h = x11->buf_h * x11->font_height;
 
@@ -430,15 +435,10 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
       } break;
       case 'm': {
         // SGR - Select Graphic Rendition
-        int arg1 = atoi_range(buf, len - 1, 0);
-        if (arg1 == 0) {
+        //int arg1 = atoi_range(buf, len - 1, 0);
+        //if (arg1 == 0) {
             // reset
-        }
-      } break;
-      case 'h':
-      case 'r':
-      case 'l': {
-        // Ignored
+        //}
       } break;
       case 'J': {
         int arg1;
@@ -483,9 +483,47 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
       } break;
       case 'H': {
         int r, c;
-        sscanf(buf, "%d;%dH", &r, &c);
+        if (len > 1) {
+            sscanf(buf, "%d;%dH", &r, &c);
+            printf("H %d %d\n", r, c);
+        }
+        else {
+            r = c = 1;
+        }
         x11->buf_x = c - 1;
         x11->buf_y = r - 1;
+      } break;
+      case 'K': {
+        int arg1 = atoi_range(buf, len - 1, 0);
+        switch (arg1) {
+          case 0: {
+            for (char *a = cursor; a != lend + 1; ++a)
+                *a = ' ';
+          } break;
+          default:
+            exit(1);
+        }
+      } break;
+      case 'r': {
+        if (len >= 1) {
+            int start, end;
+            sscanf(buf, "%d;%dr", &start, &end);
+            x11->scr_begin = start - 1;
+            x11->scr_end   = end - 1;
+        }
+        else {
+            x11->scr_begin = 0;
+            x11->scr_end   = x11->buf_h - 1;
+        }
+        printf("Scroll region set to %d %d\n", x11->scr_begin, x11->scr_end);
+      } break;
+      case 'l': {
+        // CSI ? P m l   DEC Private Mode Reset (DECRST)
+        //        P s = 2 5 → Hide Cursor (DECTCEM)
+      } break;
+      case 'h': {
+        // CSI ? P m h   DEC Private Mode Set (DECSET) P s = 2 5 → Show
+        // Cursor (DECTCEM)
       } break;
       default: {
         exit(1);
@@ -542,7 +580,7 @@ int run(struct PTY *pty, struct X11 *x11)
                 perror(NULL);
                 return 1;
             }
-
+#if 0
             char printbuf[2];
 
             if (buf[0] >= 32 && buf[0] <= 126)
@@ -555,14 +593,13 @@ int run(struct PTY *pty, struct X11 *x11)
                    printbuf,
                    (int)buf[0],
                    (unsigned char)buf[0]);
-
+#endif
             if (read_escape_mode) {
                 read_escape_mode = false;
                 switch (buf[0]) {
                   case '[':
                     read_csi  = true;
                     csi_buf_i = 0;
-                    printf("Escape code csi\n");
                     break;
                   default:
                     printf("Escape code unknown\n");
@@ -658,14 +695,14 @@ int run(struct PTY *pty, struct X11 *x11)
                  *
                  * After the memmove(), the last line still has the old
                  * content. We must clear it. */
-                if (x11->buf_y >= x11->buf_h) {
-                    memmove(x11->buf,
-                            &x11->buf[x11->buf_w],
-                            x11->buf_w * (x11->buf_h - 1));
-                    x11->buf_y = x11->buf_h - 1;
+                if (x11->buf_y > x11->scr_end) {
+                    memmove(x11->buf + x11->scr_begin * x11->buf_w,
+                            x11->buf + (1 + x11->scr_begin) * x11->buf_w,
+                            x11->buf_w * (x11->scr_end - x11->scr_begin));
+                    x11->buf_y = x11->scr_end;
 
                     for (i = 0; i < x11->buf_w; i++)
-                        x11->buf[x11->buf_y * x11->buf_w + i] = 0;
+                        x11->buf[x11->buf_y * x11->buf_w + i] = ' ';
                 }
             }
 
