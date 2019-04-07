@@ -2,6 +2,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <ctype.h>
+#include <wchar.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -38,12 +39,13 @@ struct X11 {
     int           w, h;
 
     XFontStruct *xfont;
+    XFontSet     xfontset;
     int          font_width, font_height;
 
-    char *buf;
+    wchar_t *buf;
     int   buf_w, buf_h;
     int   buf_x, buf_y;
-    bool  blink;
+    bool  blink, cur;
 
     int scr_begin, scr_end;
 };
@@ -166,6 +168,27 @@ char IsKeypad(KeySym keysym)
     };
 }
 
+wchar_t utf8_to_utf32(char* buf, size_t size)
+{
+    return L'é';
+    if (size == 1)
+        return (buf[0] & 0x7F);
+    else if (size == 2)
+        return (buf[0] & 0x1F) << 6 | (buf[1] & 0x3F);
+    else if (size == 3) {
+        printf("'%x' '%x' '%x'\n",
+               (int)0xFF & buf[0],
+               (int)0xFF & buf[1],
+               (int)0xFF & buf[2]);
+        return (buf[0] & 0x0F) << 12 | (buf[1] & 0x3F) << 6 | (buf[2] & 0x3F);
+    }
+    else if (size == 4)
+        return (buf[0] & 0x07) << 18 | (buf[1] & 0x3F) << 12 |
+               (buf[2] & 0x3F) << 6 | (buf[3] & 0x3F);
+    else
+        exit(1);
+}
+
 void x11_key(XKeyEvent *ev, struct PTY *pty)
 {
     char   buf[32];
@@ -192,14 +215,19 @@ void x11_key(XKeyEvent *ev, struct PTY *pty)
         //        fflush(stdout);
         //        printf("'\n");
     }
+    int ignore;
     for (i = 0; i < num; i++)
-        write(pty->master, &buf[i], 1);
+        ignore = write(pty->master, &buf[i], 1);
+    (void)ignore;
 }
 
 void x11_redraw(struct X11 *x11)
 {
+    if (!x11->cur)
+        return;
+
     int  x, y;
-    char buf[1];
+    wchar_t buf[1];
 
     XSetForeground(x11->dpy, x11->termgc, x11->col_bg);
     XFillRectangle(x11->dpy, x11->termwin, x11->termgc, 0, 0, x11->w, x11->h);
@@ -224,14 +252,15 @@ void x11_redraw(struct X11 *x11)
         for (x = 0; x < x11->buf_w; x++) {
             buf[0] = x11->buf[y * x11->buf_w + x];
             if (!iscntrl(buf[0])) {
-                XDrawString(x11->dpy,
-                            x11->termwin,
-                            x11->termgc,
-                            x * x11->font_width,
-                            y * x11->font_height + x11->xfont->ascent,
-                            buf,
-                            1);
-            }
+                XwcDrawString(x11->dpy,
+                              x11->termwin,
+                              x11->xfontset,
+                              x11->termgc,
+                              x * x11->font_width,
+                              y * x11->font_height + x11->xfont->ascent,
+                              buf,
+                              1);
+           }
         }
     }
 
@@ -249,6 +278,7 @@ bool x11_setup(struct X11 *x11)
     };
 
     x11->blink = true;
+    x11->cur = true;
 
     x11->dpy = XOpenDisplay(NULL);
     if (x11->dpy == NULL) {
@@ -263,10 +293,20 @@ bool x11_setup(struct X11 *x11)
     const char *font;
 
     font = "-*-fixed-medium-*-normal-*-*-140-*-*-*-90-*-";
+
+    char **missing_charsets;
+    int    num_missing_charsets;
+    char  *default_string;
+
+    x11->xfontset = XCreateFontSet(x11->dpy,
+                                   font,
+                                   &missing_charsets,
+                                   &num_missing_charsets,
+                                   &default_string);
+
     font = "fixed";
     font = "12x24";
     font = "8x16";
-
     x11->xfont = XLoadQueryFont(x11->dpy, font);
     if (x11->xfont == NULL) {
         fprintf(stderr, "Could not load font\n");
@@ -304,7 +344,7 @@ bool x11_setup(struct X11 *x11)
     x11->buf_h = 25;
     x11->buf_x = 0;
     x11->buf_y = 0;
-    x11->buf   = calloc(x11->buf_w * x11->buf_h, 1);
+    x11->buf   = calloc(x11->buf_w * x11->buf_h * sizeof(x11->buf[0]), 1);
     if (x11->buf == NULL) {
         perror("calloc");
         return false;
@@ -403,9 +443,9 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
 
     printf("Processing CSI '%s' op %c\n", buf, op);
 
-    char * const lstart = x11->buf + x11->buf_w * x11->buf_y;
-    char * const cursor = lstart + x11->buf_x;
-    char * const lend   = lstart + x11->buf_w - 1;
+    wchar_t * const lstart = x11->buf + x11->buf_w * x11->buf_y;
+    wchar_t * const cursor = lstart + x11->buf_x;
+    wchar_t * const lend   = lstart + x11->buf_w - 1;
 
     switch (op) {
       case '@': {
@@ -417,18 +457,18 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         //  insert 2 : |---c123456|
         //             |---__c1234|
         int num = atoi_range(buf, len - 1, 1);
-        for (char *source = lend - num, *dest = lend; source >= cursor;
+        for (wchar_t *source = lend - num, *dest = lend; source >= cursor;
              --dest, --source)
             *dest = *source;
 
-        for (char *bend = cursor + num - 1; bend != cursor - 1; --bend)
+        for (wchar_t *bend = cursor + num - 1; bend != cursor - 1; --bend)
             *bend = ' ';
 
       } break;
       case 'P': {
         // Delete characters
         int num = atoi_range(buf, len - 1, 1);
-        for (char *source = cursor + num, *dest = cursor; source != lend + 1;
+        for (wchar_t *source = cursor + num, *dest = cursor; source != lend + 1;
              ++source, ++dest)
             *dest = *source;
 
@@ -444,7 +484,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         int arg1;
         sscanf(buf, "%dJ", &arg1);
         if (arg1 == 2) {
-            for (char *a = x11->buf; a != x11->buf + x11->buf_w * x11->buf_h;
+            for (wchar_t *a = x11->buf; a != x11->buf + x11->buf_w * x11->buf_h;
                  ++a)
                 *a = ' ';
             x11->buf_x = 0;
@@ -468,8 +508,10 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             send[7] = ';';
             send[8] = '0';
             send[9] = 'c';
+            int ignore;
             for (int i = 0; i < num; i++)
-                write(pty->master, &send[i], 1);
+                ignore = write(pty->master, &send[i], 1);
+            (void)ignore;
         }
         else {
             exit(1);
@@ -497,7 +539,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         int arg1 = atoi_range(buf, len - 1, 0);
         switch (arg1) {
           case 0: {
-            for (char *a = cursor; a != lend + 1; ++a)
+            for (wchar_t *a = cursor; a != lend + 1; ++a)
                 *a = ' ';
           } break;
           default:
@@ -518,12 +560,24 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         printf("Scroll region set to %d %d\n", x11->scr_begin, x11->scr_end);
       } break;
       case 'l': {
+        int arg1;
+        sscanf(buf,"?%dl", &arg1);
         // CSI ? P m l   DEC Private Mode Reset (DECRST)
-        //        P s = 2 5 → Hide Cursor (DECTCEM)
+        if (arg1 == 25) {
+            //        P s = 2 5 → Hide Cursor (DECTCEM)
+            x11->cur = false;
+            printf("Hiding Cursor\n");
+        }
       } break;
       case 'h': {
-        // CSI ? P m h   DEC Private Mode Set (DECSET) P s = 2 5 → Show
-        // Cursor (DECTCEM)
+        // CSI ? P m h   DEC Private Mode Set (DECSET) 
+        int arg1;
+        sscanf(buf,"?%dh", &arg1);
+        if (arg1 == 25) {
+            //        P s = 2 5 → Show Cursor (DECTCEM)
+            x11->cur = true;
+            printf("Unhiding Cursor\n");
+        }
       } break;
       default: {
         exit(1);
@@ -543,7 +597,7 @@ int run(struct PTY *pty, struct X11 *x11)
     bool   read_csi         = false;
 
     char   csi_buf[20];
-    size_t csi_buf_i;
+    size_t csi_buf_i = 0;
 
     struct timeval timeout;
 
@@ -564,7 +618,7 @@ int run(struct PTY *pty, struct X11 *x11)
         if (num == 0) {
             x11->blink = !x11->blink;
             x11_redraw(x11);
-            printf("Timeout\n");
+            //printf("Timeout\n");
             continue;
         }
         else if (num == -1) {
@@ -633,6 +687,7 @@ int run(struct PTY *pty, struct X11 *x11)
                     read_escape_mode = true;
                 }
                 else if (buf[0] != '\n') {
+                    wchar_t glyph = buf[0];
                     if ((buf[0] & 0x80) != 0) {
                         // utf8 character
                         size_t n = 1;
@@ -642,8 +697,6 @@ int run(struct PTY *pty, struct X11 *x11)
                             n = 2;
                         else if ((buf[0] & 0xF8) == 0xF0)
                             n = 3;
-
-                        printf("Utf8 character %zu bytes\n", n + 1);
 
                         char utf8[n + 1];
                         utf8[0] = buf[0];
@@ -655,13 +708,12 @@ int run(struct PTY *pty, struct X11 *x11)
                             return 1;
                         }
 
-                        buf[0] = '%';
+                        glyph = utf8_to_utf32(utf8, n + 1);
                     }
-
                     /* If this is a regular byte, store it and advance
                      * the cursor one cell "to the right". This might
                      * actually wrap to the next line, see below. */
-                    x11->buf[x11->buf_y * x11->buf_w + x11->buf_x] = buf[0];
+                    x11->buf[x11->buf_y * x11->buf_w + x11->buf_x] = glyph;
                     x11->buf_x++;
 
                     if (x11->buf_x >= x11->buf_w) {
@@ -733,7 +785,8 @@ int run(struct PTY *pty, struct X11 *x11)
             if (n != 0) {
                 printf("Stdin read %zu chars\n", n);
                 for (size_t i = 0; i < n; i++) {
-                    write(pty->master, &buf[i], 1);
+                    int ignore = write(pty->master, &buf[i], 1);
+                    (void)ignore;
                 }
             }
             else {
