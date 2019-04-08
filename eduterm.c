@@ -170,7 +170,6 @@ char IsKeypad(KeySym keysym)
 
 wchar_t utf8_to_utf32(char* buf, size_t size)
 {
-    return L'é';
     if (size == 1)
         return (buf[0] & 0x7F);
     else if (size == 2)
@@ -187,6 +186,52 @@ wchar_t utf8_to_utf32(char* buf, size_t size)
                (buf[2] & 0x3F) << 6 | (buf[3] & 0x3F);
     else
         exit(1);
+}
+
+void print_utf32(wchar_t ch)
+{
+    char   buf[5];  // 4 utf8 bytes plus \0
+    size_t len;     // length minus \0
+
+    char *target = buf;
+
+    static const wchar_t    byteMask     = 0xBF;
+    static const wchar_t    byteMark     = 0x80;
+    static const char       firstByteMark[7] = {
+        0x00, 0x00, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC};
+
+    if (ch < (wchar_t)0x80) {
+        len = 1;
+    }
+    else if (ch < (wchar_t)0x800) {
+        len = 2;
+    }
+    else if (ch < (wchar_t)0x10000) {
+        len = 3;
+    }
+    else {
+        len = 4;
+    }
+
+    target += len;
+
+    switch (len) { /* note: everything falls through. */
+      case 4:
+        *--target = (char)((ch | byteMark) & byteMask);
+        ch >>= 6;
+      case 3:
+        *--target = (char)((ch | byteMark) & byteMask);
+        ch >>= 6;
+      case 2:
+        *--target = (char)((ch | byteMark) & byteMask);
+        ch >>= 6;
+      case 1:
+        *--target = (char)(ch | firstByteMark[len]);
+    }
+
+    buf[len] = '\0';
+
+    printf("%s", buf);
 }
 
 void x11_key(XKeyEvent *ev, struct PTY *pty)
@@ -710,6 +755,11 @@ int run(struct PTY *pty, struct X11 *x11)
 
                         glyph = utf8_to_utf32(utf8, n + 1);
                     }
+
+                    printf("Glyph received '");
+                    print_utf32(glyph);
+                    printf("'\n");
+
                     /* If this is a regular byte, store it and advance
                      * the cursor one cell "to the right". This might
                      * actually wrap to the next line, see below. */
