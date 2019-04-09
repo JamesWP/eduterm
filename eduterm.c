@@ -27,6 +27,34 @@ struct PTY {
     int master, slave;
 };
 
+struct RGB {
+    unsigned char r, g, b;
+};
+
+static struct RGB col_os_vals[8 + 8] = {{0, 0, 0},         // black
+                                        {205, 0, 0},       // red
+                                        {0, 205, 0},       // green
+                                        {205, 205, 0},     // yellow
+                                        {0, 0, 238},       // blue
+                                        {205, 0, 205},     // magenta
+                                        {0, 205, 205},     // cyan
+                                        {229, 229, 229},   // white
+                                        {127, 127, 127},   // bright black
+                                        {255, 0, 0},       // bright red
+                                        {0, 255, 0},       // bright green
+                                        {255, 255, 0},     // bright yellow
+                                        {92, 92, 255},     // bright blue
+                                        {255, 0, 255},     // bright magenta
+                                        {0, 255, 255},     // bright cyan
+                                        {255, 255, 255}};  // bright white
+
+static size_t col_os_length = sizeof(col_os_vals) / sizeof(col_os_vals[0]);
+
+struct cell {
+    wchar_t       g;
+    unsigned long fg;
+};
+
 struct X11 {
     int      fd;
     Display *dpy;
@@ -42,12 +70,17 @@ struct X11 {
     XFontSet     xfontset;
     int          font_width, font_height;
 
-    wchar_t *buf;
+    struct cell *buf;
     int   buf_w, buf_h;
     int   buf_x, buf_y;
     bool  blink, cur;
 
     int scr_begin, scr_end;
+
+    unsigned long sgr_fg_col;
+
+    // oldscool 3/4 bit colors, normal and bright versions
+    unsigned long col_os[8 + 8];
 };
 
 bool term_set_size(struct PTY *pty, struct X11 *x11)
@@ -292,11 +325,12 @@ void x11_redraw(struct X11 *x11)
                    x11->font_width,
                    x11->font_height);
 
-    XSetForeground(x11->dpy, x11->termgc, x11->col_fg);
     for (y = 0; y < x11->buf_h; y++) {
         for (x = 0; x < x11->buf_w; x++) {
-            buf[0] = x11->buf[y * x11->buf_w + x];
+            struct cell *c = x11->buf + (y * x11->buf_w + x);
+            buf[0]         = c->g;
             if (!iscntrl(buf[0])) {
+                XSetForeground(x11->dpy, x11->termgc, c->fg);
                 XwcDrawString(x11->dpy,
                               x11->termwin,
                               x11->xfontset,
@@ -372,13 +406,32 @@ bool x11_setup(struct X11 *x11)
         fprintf(stderr, "Could not load fg color\n");
         return false;
     }
+
     x11->col_fg = color.pixel;
+    x11->sgr_fg_col = x11->col_fg;
 
     if (!XAllocNamedColor(x11->dpy, cmap, "#444444", &color, &color)) {
         fprintf(stderr, "Could not load blink color\n");
         return false;
     }
     x11->col_bk = color.pixel;
+
+    for (int i = 0; i < (int)col_os_length; i++) {
+        XColor c;
+        c.red   = col_os_vals[i].r * 256;
+        c.green = col_os_vals[i].g * 256;
+        c.blue  = col_os_vals[i].b * 256;
+        if (!XAllocColor(x11->dpy, cmap, &c)) {
+            fprintf(stderr, "Could not load col_os[%d] color\n", i);
+            return false;
+        }
+        x11->col_os[i] = c.pixel;
+        //printf("Alloc color %d, %d, %d = %d\n",
+        //       (int)c.red,
+        //       (int)c.green,
+        //       (int)c.blue,
+        //       (int)c.pixel);
+    }
 
     /* The terminal will have a fixed size of 80x25 cells. This is an
      * arbitrary number. No resizing has been implemented and child
@@ -488,9 +541,9 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
 
     printf("Processing CSI '%s' op %c\n", buf, op);
 
-    wchar_t * const lstart = x11->buf + x11->buf_w * x11->buf_y;
-    wchar_t * const cursor = lstart + x11->buf_x;
-    wchar_t * const lend   = lstart + x11->buf_w - 1;
+    struct cell * const lstart = x11->buf + x11->buf_w * x11->buf_y;
+    struct cell * const cursor = lstart + x11->buf_x;
+    struct cell * const lend   = lstart + x11->buf_w - 1;
 
     switch (op) {
       case '@': {
@@ -502,36 +555,67 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         //  insert 2 : |---c123456|
         //             |---__c1234|
         int num = atoi_range(buf, len - 1, 1);
-        for (wchar_t *source = lend - num, *dest = lend; source >= cursor;
+        for (struct cell *source = lend - num, *dest = lend; source >= cursor;
              --dest, --source)
             *dest = *source;
 
-        for (wchar_t *bend = cursor + num - 1; bend != cursor - 1; --bend)
-            *bend = ' ';
+        for (struct cell *bend = cursor + num - 1; bend != cursor - 1;
+             --bend) {
+            bend->g  = ' ';
+            bend->fg = x11->col_fg;
+        }
 
       } break;
       case 'P': {
         // Delete characters
         int num = atoi_range(buf, len - 1, 1);
-        for (wchar_t *source = cursor + num, *dest = cursor; source != lend + 1;
+        for (struct cell *source = cursor + num, *dest = cursor;
+             source != lend + 1;
              ++source, ++dest)
             *dest = *source;
 
       } break;
       case 'm': {
         // SGR - Select Graphic Rendition
-        //int arg1 = atoi_range(buf, len - 1, 0);
-        //if (arg1 == 0) {
-            // reset
-        //}
+        char *arg_s = strtok(buf, ";");
+        while (arg_s) {
+            int arg = atoi(arg_s);
+            arg_s   = strtok(NULL, ";");
+            switch (arg) {
+              case 0:
+                x11->sgr_fg_col = x11->col_fg;
+                break;
+              case 30:
+              case 31:
+              case 32:
+              case 33:
+              case 34:
+              case 35:
+              case 36:
+              case 37:
+                x11->sgr_fg_col = x11->col_os[arg - 30];
+                break;
+              case 91:
+              case 92:
+              case 93:
+              case 94:
+              case 95:
+              case 96:
+              case 97:
+                x11->sgr_fg_col = x11->col_os[arg - 90 + 8];
+                break;
+            }
+        }
       } break;
       case 'J': {
         int arg1;
         sscanf(buf, "%dJ", &arg1);
-        if (arg1 == 2) {
-            for (wchar_t *a = x11->buf; a != x11->buf + x11->buf_w * x11->buf_h;
-                 ++a)
-                *a = ' ';
+        if (arg1 == 2 || arg1 == 3) {
+            for (struct cell *a = x11->buf; a != x11->buf + x11->buf_w * x11->buf_h;
+                 ++a){
+                a->g  = ' ';
+                a->fg = x11->col_fg;
+            }
             x11->buf_x = 0;
             x11->buf_y = 0;
         }
@@ -584,8 +668,10 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         int arg1 = atoi_range(buf, len - 1, 0);
         switch (arg1) {
           case 0: {
-            for (wchar_t *a = cursor; a != lend + 1; ++a)
-                *a = ' ';
+            for (struct cell *a = cursor; a != lend + 1; ++a) {
+                a->g  = ' ';
+                a->fg = x11->col_fg;
+            }
           } break;
           default:
             exit(1);
@@ -663,7 +749,9 @@ int run(struct PTY *pty, struct X11 *x11)
         if (num == 0) {
             x11->blink = !x11->blink;
             x11_redraw(x11);
-            //printf("Timeout\n");
+            // static int col_n = 0;
+            // x11->col_bg = x11->col_os[++col_n % col_os_length];
+            // printf("Timeout %lu %d\n", x11->col_bg, col_n);
             continue;
         }
         else if (num == -1) {
@@ -763,7 +851,9 @@ int run(struct PTY *pty, struct X11 *x11)
                     /* If this is a regular byte, store it and advance
                      * the cursor one cell "to the right". This might
                      * actually wrap to the next line, see below. */
-                    x11->buf[x11->buf_y * x11->buf_w + x11->buf_x] = glyph;
+                    x11->buf[x11->buf_y * x11->buf_w + x11->buf_x].g = glyph;
+                    x11->buf[x11->buf_y * x11->buf_w + x11->buf_x].fg =
+                        x11->sgr_fg_col;
                     x11->buf_x++;
 
                     if (x11->buf_x >= x11->buf_w) {
@@ -803,8 +893,10 @@ int run(struct PTY *pty, struct X11 *x11)
                             x11->buf_w * (x11->scr_end - x11->scr_begin));
                     x11->buf_y = x11->scr_end;
 
-                    for (i = 0; i < x11->buf_w; i++)
-                        x11->buf[x11->buf_y * x11->buf_w + i] = ' ';
+                    for (i = 0; i < x11->buf_w; i++) {
+                        x11->buf[x11->buf_y * x11->buf_w + i].g = ' ';
+                        x11->buf[x11->buf_y * x11->buf_w + i].fg = x11->col_fg;
+                    }
                 }
             }
 
