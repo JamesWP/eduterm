@@ -2,7 +2,6 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <ctype.h>
-#include <wchar.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -16,6 +15,7 @@
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
+#include <wchar.h>
 
 /* Launching /bin/sh may launch a GNU Bash and that can have nasty side
  * effects. On my system, it clobbers ~/.bash_history because it doesn't
@@ -53,6 +53,7 @@ static size_t col_os_length = sizeof(col_os_vals) / sizeof(col_os_vals[0]);
 struct cell {
     wchar_t       g;
     unsigned long fg;
+    unsigned long bg;
 };
 
 struct X11 {
@@ -70,14 +71,17 @@ struct X11 {
     XFontSet     xfontset;
     int          font_width, font_height;
 
+    struct cell *buf_alt;
     struct cell *buf;
-    int   buf_w, buf_h;
-    int   buf_x, buf_y;
-    bool  blink, cur;
+    int          buf_w, buf_h;
+    int          buf_x, buf_y;
+    int          buf_alt_x, buf_alt_y;
+    bool         blink, cur;
 
     int scr_begin, scr_end;
 
     unsigned long sgr_fg_col;
+    unsigned long sgr_bg_col;
 
     // oldscool 3/4 bit colors, normal and bright versions
     unsigned long col_os[8 + 8];
@@ -201,7 +205,7 @@ char IsKeypad(KeySym keysym)
     };
 }
 
-wchar_t utf8_to_utf32(char* buf, size_t size)
+wchar_t utf8_to_utf32(char *buf, size_t size)
 {
     if (size == 1)
         return (buf[0] & 0x7F);
@@ -228,9 +232,9 @@ void print_utf32(wchar_t ch)
 
     char *target = buf;
 
-    static const wchar_t    byteMask     = 0xBF;
-    static const wchar_t    byteMark     = 0x80;
-    static const char       firstByteMark[7] = {
+    static const wchar_t byteMask         = 0xBF;
+    static const wchar_t byteMark         = 0x80;
+    static const char    firstByteMark[7] = {
         0x00, 0x00, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC};
 
     if (ch < (wchar_t)0x80) {
@@ -277,7 +281,7 @@ void x11_key(XKeyEvent *ev, struct PTY *pty)
     buf[num] = 0;
 
     if (IsTtyFunctionOrSpaceKey(ksym)) {
-        printf("XKeyEvent non character\n");
+        // printf("XKeyEvent non character\n");
     }
     else if (IsKeypad(ksym) != '\0') {
         printf("XKeyEvent arrow key\n");
@@ -287,7 +291,7 @@ void x11_key(XKeyEvent *ev, struct PTY *pty)
         buf[2] = IsKeypad(ksym);
     }
     else {
-        printf("XKeyEvent string = '%s'\n", buf);
+        // printf("XKeyEvent string = '%s'\n", buf);
         //        fflush(stdout);
         //        write(1, buf, num);
         //        fflush(stdout);
@@ -304,7 +308,7 @@ void x11_redraw(struct X11 *x11)
     if (!x11->cur)
         return;
 
-    int  x, y;
+    int     x, y;
     wchar_t buf[1];
 
     XSetForeground(x11->dpy, x11->termgc, x11->col_bg);
@@ -331,6 +335,7 @@ void x11_redraw(struct X11 *x11)
             buf[0]         = c->g;
             if (!iscntrl(buf[0])) {
                 XSetForeground(x11->dpy, x11->termgc, c->fg);
+                XSetBackground(x11->dpy, x11->termgc, c->bg);
                 XwcDrawString(x11->dpy,
                               x11->termwin,
                               x11->xfontset,
@@ -339,7 +344,7 @@ void x11_redraw(struct X11 *x11)
                               y * x11->font_height + x11->xfont->ascent,
                               buf,
                               1);
-           }
+            }
         }
     }
 
@@ -357,7 +362,7 @@ bool x11_setup(struct X11 *x11)
     };
 
     x11->blink = true;
-    x11->cur = true;
+    x11->cur   = true;
 
     x11->dpy = XOpenDisplay(NULL);
     if (x11->dpy == NULL) {
@@ -383,9 +388,9 @@ bool x11_setup(struct X11 *x11)
                                    &num_missing_charsets,
                                    &default_string);
 
-    font = "fixed";
-    font = "12x24";
-    font = "8x16";
+    font       = "fixed";
+    font       = "12x24";
+    font       = "8x16";
     x11->xfont = XLoadQueryFont(x11->dpy, font);
     if (x11->xfont == NULL) {
         fprintf(stderr, "Could not load font\n");
@@ -407,8 +412,9 @@ bool x11_setup(struct X11 *x11)
         return false;
     }
 
-    x11->col_fg = color.pixel;
+    x11->col_fg     = color.pixel;
     x11->sgr_fg_col = x11->col_fg;
+    x11->sgr_bg_col = x11->col_bg;
 
     if (!XAllocNamedColor(x11->dpy, cmap, "#444444", &color, &color)) {
         fprintf(stderr, "Could not load blink color\n");
@@ -440,10 +446,15 @@ bool x11_setup(struct X11 *x11)
      * buf_x, buf_y will be the current cursor position. */
     x11->buf_w = 80;
     x11->buf_h = 25;
-    x11->buf_x = 0;
-    x11->buf_y = 0;
+    x11->buf_x = x11->buf_alt_x = 0;
+    x11->buf_y = x11->buf_alt_y = 0;
     x11->buf   = calloc(x11->buf_w * x11->buf_h * sizeof(x11->buf[0]), 1);
     if (x11->buf == NULL) {
+        perror("calloc");
+        return false;
+    }
+    x11->buf_alt = calloc(x11->buf_w * x11->buf_h * sizeof(x11->buf[0]), 1);
+    if (x11->buf_alt == NULL) {
         perror("calloc");
         return false;
     }
@@ -526,9 +537,14 @@ bool is_final_csi_byte(char b)
     return b >= 0x40 && b <= 0x73;
 }
 
-int atoi_range(char* buf, size_t len, int def)
+bool is_final_osi_byte(char b)
 {
-    int  s = def;
+    return b == 7;
+}
+
+int atoi_range(char *buf, size_t len, int def)
+{
+    int s = def;
     if (len >= 1) {
         s = atoi(buf);
     }
@@ -539,11 +555,16 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
 {
     char op = buf[len];
 
-    printf("Processing CSI '%s' op %c\n", buf, op);
+    switch (op) {
+      case 'm':
+        break;
+      default:
+        printf("Processing CSI '%s' op %c\n", buf, op);
+    }
 
-    struct cell * const lstart = x11->buf + x11->buf_w * x11->buf_y;
-    struct cell * const cursor = lstart + x11->buf_x;
-    struct cell * const lend   = lstart + x11->buf_w - 1;
+    struct cell *const lstart = x11->buf + x11->buf_w * x11->buf_y;
+    struct cell *const cursor = lstart + x11->buf_x;
+    struct cell *const lend   = lstart + x11->buf_w - 1;
 
     switch (op) {
       case '@': {
@@ -563,6 +584,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
              --bend) {
             bend->g  = ' ';
             bend->fg = x11->col_fg;
+            bend->bg = x11->col_bg;
         }
 
       } break;
@@ -584,6 +606,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             switch (arg) {
               case 0:
                 x11->sgr_fg_col = x11->col_fg;
+                x11->sgr_bg_col = x11->col_bg;
                 break;
               case 30:
               case 31:
@@ -595,6 +618,16 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
               case 37:
                 x11->sgr_fg_col = x11->col_os[arg - 30];
                 break;
+              case 40:
+              case 41:
+              case 42:
+              case 43:
+              case 44:
+              case 45:
+              case 46:
+              case 47:
+                x11->sgr_bg_col = x11->col_os[arg - 40];
+                break;
               case 91:
               case 92:
               case 93:
@@ -604,6 +637,15 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
               case 97:
                 x11->sgr_fg_col = x11->col_os[arg - 90 + 8];
                 break;
+              case 101:
+              case 102:
+              case 103:
+              case 104:
+              case 105:
+              case 106:
+              case 107:
+                x11->sgr_bg_col = x11->col_os[arg - 100 + 8];
+                break;
             }
         }
       } break;
@@ -611,10 +653,12 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         int arg1;
         sscanf(buf, "%dJ", &arg1);
         if (arg1 == 2 || arg1 == 3) {
-            for (struct cell *a = x11->buf; a != x11->buf + x11->buf_w * x11->buf_h;
-                 ++a){
+            for (struct cell *a = x11->buf;
+                 a != x11->buf + x11->buf_w * x11->buf_h;
+                 ++a) {
                 a->g  = ' ';
                 a->fg = x11->col_fg;
+                a->bg = x11->col_bg;
             }
             x11->buf_x = 0;
             x11->buf_y = 0;
@@ -625,21 +669,10 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
       } break;
       case 'c': {
         if (buf[0] == '>') {
-            int  num = 10;
-            char send[num];
-            send[0] = (char)27;
-            send[1] = '[';
-            send[2] = '>';
-            send[3] = '1';
-            send[4] = ';';
-            send[5] = '9';
-            send[6] = '5';
-            send[7] = ';';
-            send[8] = '0';
-            send[9] = 'c';
+            const char* reply = "\e[?63;1;2;4;6;9;15;22;29c";
+            int  num = strlen(reply);
             int ignore;
-            for (int i = 0; i < num; i++)
-                ignore = write(pty->master, &send[i], 1);
+                ignore = write(pty->master, reply, num);
             (void)ignore;
         }
         else {
@@ -656,13 +689,14 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         int r, c;
         if (len > 1) {
             sscanf(buf, "%d;%dH", &r, &c);
-            printf("H %d %d\n", r, c);
         }
         else {
             r = c = 1;
         }
         x11->buf_x = c - 1;
         x11->buf_y = r - 1;
+        x11->buf_x = x11->buf_x < x11->buf_w ? x11->buf_x : x11->buf_w - 1;
+        x11->buf_y = x11->buf_y < x11->buf_h ? x11->buf_y : x11->buf_h - 1;
       } break;
       case 'K': {
         int arg1 = atoi_range(buf, len - 1, 0);
@@ -671,6 +705,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             for (struct cell *a = cursor; a != lend + 1; ++a) {
                 a->g  = ' ';
                 a->fg = x11->col_fg;
+                a->bg = x11->col_bg;
             }
           } break;
           default:
@@ -692,7 +727,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
       } break;
       case 'l': {
         int arg1;
-        sscanf(buf,"?%dl", &arg1);
+        sscanf(buf, "?%dl", &arg1);
         // CSI ? P m l   DEC Private Mode Reset (DECRST)
         if (arg1 == 25) {
             //        P s = 2 5 → Hide Cursor (DECTCEM)
@@ -701,13 +736,99 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         }
       } break;
       case 'h': {
-        // CSI ? P m h   DEC Private Mode Set (DECSET) 
+        //  CSI ? P m h   DEC Private Mode Set (DECSET)
+        if (buf[0] != '?')
+            exit(1);
+
+        char *arg_s = strtok(buf+1, ";");
+        while (arg_s) {
+            int arg1 = atoi(arg_s);
+            printf("h arg1 %d", arg1);
+            arg_s    = strtok(NULL, ";");
+            switch (arg1) {
+              case 1: case 12: {
+                //  P s = 1 → Application Cursor Keys (DECCKM)
+                //  P s = 1 2 → Start Blinking Cursor (att610) 
+              } break;
+              case 25: {
+                //        P s = 2 5 → Show Cursor (DECTCEM)
+                x11->cur = true;
+                printf("Unhiding Cursor\n");
+              } break;
+              case 1049: {
+                //        P s = 1 0 4 7 → Use Alternate Screen Buffer (unless
+                //        disabled by the titeInhibit resource)
+                //        P s = 1 0 4 8 → Save cursor as in DECSC (unless
+                //        disabled by the titeInhibit resource)
+                //        P s = 1 0 4 9 → Save cursor as in DECSC and use
+                //        Alternate Screen Buffer,
+                //                        clearing it first (unless disabled by
+                //                        the titeInhibit resource).
+                //                        This combines the effects of the 1047
+                //                        and 1048 modes.
+                //                        Use this with terminfo-based
+                //                        applications rather than the 47 mode.
+                for (struct cell *cur = x11->buf;
+                     cur < x11->buf + x11->buf_w * x11->buf_h;
+                     ++cur) {
+                    cur->g  = ' ';
+                    cur->fg = x11->col_fg;
+                    cur->bg = x11->col_bg;
+                }
+
+                struct cell *tmp = x11->buf;
+
+                x11->buf     = x11->buf_alt;
+                x11->buf_alt = tmp;
+
+                int tmpc;
+                tmpc           = x11->buf_x;
+                x11->buf_x     = x11->buf_alt_x;
+                x11->buf_alt_x = tmpc;
+
+                tmpc           = x11->buf_y;
+                x11->buf_y     = x11->buf_alt_y;
+                x11->buf_alt_y = tmpc;
+              } break;
+              default:
+                exit(1);
+            }
+        }
+      } break;
+      case 'M': {
         int arg1;
-        sscanf(buf,"?%dh", &arg1);
-        if (arg1 == 25) {
-            //        P s = 2 5 → Show Cursor (DECTCEM)
-            x11->cur = true;
-            printf("Unhiding Cursor\n");
+        sscanf(buf, "%dM", &arg1);
+        // delete arg1 lines
+
+        for (struct cell *dest   = lstart,
+                         *source = dest + x11->buf_w * (arg1 - 1);
+             source < x11->buf + x11->buf_w * x11->buf_h;
+             ++source, ++dest)
+            *dest = *source;
+
+        for (struct cell *dest = x11->buf + x11->buf_w * (x11->buf_h - arg1);
+             dest < x11->buf + x11->buf_w * x11->buf_h;
+             ++dest)
+            dest->g = ' ', dest->fg = x11->col_fg, dest->bg = x11->col_bg;
+      } break;
+      case 'L': {
+        int arg1;
+        sscanf(buf, "%dM", &arg1);
+        // insert arg1 lines
+        struct cell *scroll_end = x11->buf + (x11->scr_end + 1) * x11->buf_w;
+
+        for (struct cell *dest   = scroll_end,
+                         *source = dest - x11->buf_w * arg1;
+             dest >= lstart;
+             --source, --dest)
+            *dest = *source;
+
+        for (struct cell *dest = lstart, *end = lstart + x11->buf_w * arg1;
+             dest < end;
+             ++dest) {
+            dest->g  = ' ';
+            dest->fg = x11->col_fg;
+            dest->bg = x11->col_bg;
         }
       } break;
       default: {
@@ -716,9 +837,18 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
     }
 }
 
+void process_osi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
+{
+    (void)len;
+    (void)x11;
+    (void)pty;
+
+    printf("Osi received '%s'\n", buf);
+}
+
 int run(struct PTY *pty, struct X11 *x11)
 {
-    int    i, maxfd;
+    int    maxfd;
     fd_set active;
     fd_set readable;
     XEvent ev;
@@ -726,9 +856,13 @@ int run(struct PTY *pty, struct X11 *x11)
     bool   just_wrapped     = false;
     bool   read_escape_mode = false;
     bool   read_csi         = false;
+    bool   read_osi         = false;
 
     char   csi_buf[20];
     size_t csi_buf_i = 0;
+
+    char   osi_buf[200];
+    size_t osi_buf_i = 0;
 
     struct timeval timeout;
 
@@ -749,9 +883,9 @@ int run(struct PTY *pty, struct X11 *x11)
         if (num == 0) {
             x11->blink = !x11->blink;
             x11_redraw(x11);
-            // static int col_n = 0;
-            // x11->col_bg = x11->col_os[++col_n % col_os_length];
-            // printf("Timeout %lu %d\n", x11->col_bg, col_n);
+                // static int col_n = 0; x11->col_bg = x11->col_os[++col_n %
+                // col_os_length]; printf("Timeout %lu %d\n", x11->col_bg,
+                // col_n);
             continue;
         }
         else if (num == -1) {
@@ -788,8 +922,27 @@ int run(struct PTY *pty, struct X11 *x11)
                     read_csi  = true;
                     csi_buf_i = 0;
                     break;
+                  case '=':
+                    // Application Keypad
+                    break;
+                  case ']':
+                    read_osi  = true;
+                    osi_buf_i = 0;
+                    break;
+                  case '\\':
+                    if (read_osi) {
+                        osi_buf[osi_buf_i] = '\0';
+                        process_osi(osi_buf, osi_buf_i, x11, pty);
+                        read_osi = false;
+                    }
+                    break;
+                  case '>': {  //  Normal Keypad (DECPNM)
+                  } break;
                   default:
-                    printf("Escape code unknown\n");
+                    printf("Escape code unknown '%c' (%x)\n",
+                           (int)buf[0],
+                           (int)0xFF & buf[0]);
+                    exit(1);
                 }
             }
             else if (read_csi) {
@@ -799,6 +952,15 @@ int run(struct PTY *pty, struct X11 *x11)
                     csi_buf[csi_buf_i] = '\0';
                     process_csi(csi_buf, csi_buf_i - 1, x11, pty);
                     read_csi = false;
+                }
+            }
+            else if (read_osi) {
+                osi_buf[osi_buf_i] = buf[0];
+                osi_buf_i++;
+                if (is_final_osi_byte(buf[0])) {
+                    osi_buf[osi_buf_i] = '\0';
+                    process_osi(osi_buf, osi_buf_i - 1, x11, pty);
+                    read_osi = false;
                 }
             }
             else if (buf[0] == '\r') {
@@ -844,16 +1006,17 @@ int run(struct PTY *pty, struct X11 *x11)
                         glyph = utf8_to_utf32(utf8, n + 1);
                     }
 
-                    printf("Glyph received '");
-                    print_utf32(glyph);
-                    printf("'\n");
+                    // printf("Glyph received '"); print_utf32(glyph);
+                    // printf("'\n");
 
                     /* If this is a regular byte, store it and advance
                      * the cursor one cell "to the right". This might
                      * actually wrap to the next line, see below. */
-                    x11->buf[x11->buf_y * x11->buf_w + x11->buf_x].g = glyph;
-                    x11->buf[x11->buf_y * x11->buf_w + x11->buf_x].fg =
-                        x11->sgr_fg_col;
+                    struct cell *c =
+                        x11->buf + x11->buf_y * x11->buf_w + x11->buf_x;
+                    c->g  = glyph;
+                    c->fg = x11->sgr_fg_col;
+                    c->bg = x11->sgr_bg_col;
                     x11->buf_x++;
 
                     if (x11->buf_x >= x11->buf_w) {
@@ -888,15 +1051,20 @@ int run(struct PTY *pty, struct X11 *x11)
                  * After the memmove(), the last line still has the old
                  * content. We must clear it. */
                 if (x11->buf_y > x11->scr_end) {
-                    memmove(x11->buf + x11->scr_begin * x11->buf_w,
-                            x11->buf + (1 + x11->scr_begin) * x11->buf_w,
-                            x11->buf_w * (x11->scr_end - x11->scr_begin));
-                    x11->buf_y = x11->scr_end;
+                    size_t w = x11->buf_w;
+                    for (struct cell *dest   = x11->buf + (w * x11->scr_begin),
+                                     *source = dest + w;
+                         source < x11->buf + w * (x11->scr_end + 1);
+                         ++source, ++dest)
+                        *dest = *source;
 
-                    for (i = 0; i < x11->buf_w; i++) {
-                        x11->buf[x11->buf_y * x11->buf_w + i].g = ' ';
-                        x11->buf[x11->buf_y * x11->buf_w + i].fg = x11->col_fg;
-                    }
+                    for (struct cell *dest = x11->buf + w * (x11->scr_end);
+                         dest < x11->buf + w * (x11->scr_end + 1);
+                         ++dest)
+                        dest->g = ' ', dest->fg = x11->col_fg,
+                        dest->bg = x11->col_bg;
+
+                    x11->buf_y = x11->scr_end;
                 }
             }
 
