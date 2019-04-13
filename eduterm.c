@@ -48,7 +48,7 @@ static struct RGB col_os_vals[8 + 8] = {{0, 0, 0},         // black
                                         {0, 255, 255},     // bright cyan
                                         {255, 255, 255}};  // bright white
 
-static size_t col_os_length = sizeof(col_os_vals) / sizeof(col_os_vals[0]);
+#define col_os_length (sizeof(col_os_vals) / sizeof(col_os_vals[0]))
 
 struct cell {
     wchar_t       g;
@@ -84,7 +84,8 @@ struct X11 {
     unsigned long sgr_bg_col;
 
     // oldscool 3/4 bit colors, normal and bright versions
-    unsigned long col_os[8 + 8];
+    unsigned long col_os[col_os_length];
+    unsigned long col_256[256 /* duh */];
 };
 
 bool term_set_size(struct PTY *pty, struct X11 *x11)
@@ -212,10 +213,6 @@ wchar_t utf8_to_utf32(char *buf, size_t size)
     else if (size == 2)
         return (buf[0] & 0x1F) << 6 | (buf[1] & 0x3F);
     else if (size == 3) {
-        printf("'%x' '%x' '%x'\n",
-               (int)0xFF & buf[0],
-               (int)0xFF & buf[1],
-               (int)0xFF & buf[2]);
         return (buf[0] & 0x0F) << 12 | (buf[1] & 0x3F) << 6 | (buf[2] & 0x3F);
     }
     else if (size == 4)
@@ -314,6 +311,35 @@ void x11_redraw(struct X11 *x11)
     XSetForeground(x11->dpy, x11->termgc, x11->col_bg);
     XFillRectangle(x11->dpy, x11->termwin, x11->termgc, 0, 0, x11->w, x11->h);
 
+    for (y = 0; y < x11->buf_h; y++) {
+        for (x = 0; x < x11->buf_w; x++) {
+            struct cell *c = x11->buf + (y * x11->buf_w + x);
+            buf[0]         = c->g;
+            if (!iscntrl(buf[0])) {
+                XSetForeground(x11->dpy, x11->termgc, c->bg);
+
+                XFillRectangle(x11->dpy,
+                               x11->termwin,
+                               x11->termgc,
+                               x * x11->font_width,
+                               y * x11->font_height,
+                               x11->font_width,
+                               x11->font_height);
+
+                XSetForeground(x11->dpy, x11->termgc, c->fg);
+
+                XwcDrawString(x11->dpy,
+                              x11->termwin,
+                              x11->xfontset,
+                              x11->termgc,
+                              x * x11->font_width,
+                              y * x11->font_height + x11->xfont->ascent,
+                              buf,
+                              1);
+            }
+        }
+    }
+
     if (x11->blink) {
         XSetForeground(x11->dpy, x11->termgc, x11->col_fg);
     }
@@ -329,24 +355,6 @@ void x11_redraw(struct X11 *x11)
                    x11->font_width,
                    x11->font_height);
 
-    for (y = 0; y < x11->buf_h; y++) {
-        for (x = 0; x < x11->buf_w; x++) {
-            struct cell *c = x11->buf + (y * x11->buf_w + x);
-            buf[0]         = c->g;
-            if (!iscntrl(buf[0])) {
-                XSetForeground(x11->dpy, x11->termgc, c->fg);
-                XSetBackground(x11->dpy, x11->termgc, c->bg);
-                XwcDrawString(x11->dpy,
-                              x11->termwin,
-                              x11->xfontset,
-                              x11->termgc,
-                              x * x11->font_width,
-                              y * x11->font_height + x11->xfont->ascent,
-                              buf,
-                              1);
-            }
-        }
-    }
 
     XSync(x11->dpy, False);
 }
@@ -432,11 +440,37 @@ bool x11_setup(struct X11 *x11)
             return false;
         }
         x11->col_os[i] = c.pixel;
-        //printf("Alloc color %d, %d, %d = %d\n",
-        //       (int)c.red,
-        //       (int)c.green,
-        //       (int)c.blue,
-        //       (int)c.pixel);
+        x11->col_256[i] = c.pixel;
+    }
+
+    size_t col_map_dest = 16;
+    for (int r = 0; r < 6; r++) {
+        for (int g = 0; g < 6; g++) {
+            for (int b = 0; b < 6; b++) {
+                XColor c;
+                c.red   = r * 40 * 256;
+                c.green = g * 40 * 256;
+                c.blue  = b * 40 * 256;
+                if (!XAllocColor(x11->dpy, cmap, &c)) {
+                    fprintf(stderr, "Could not load col_256[%d] color\n", col_map_dest);
+                    return false;
+                }
+                x11->col_256[col_map_dest++] = c.pixel;
+            }
+        }
+    }
+
+    for (int i = 0; i < 24; i++) {
+        XColor c;
+        c.red   = i * 10 * 256;
+        c.green = i * 10 * 256;
+        c.blue  = i * 10 * 256;
+        if (!XAllocColor(x11->dpy, cmap, &c)) {
+            fprintf(
+                stderr, "Could not load col_256[%d] color\n", col_map_dest);
+            return false;
+        }
+        x11->col_256[col_map_dest++] = c.pixel;
     }
 
     /* The terminal will have a fixed size of 80x25 cells. This is an
@@ -498,7 +532,6 @@ bool x11_setup(struct X11 *x11)
 bool spawn(struct PTY *pty)
 {
     pid_t  p;
-    char  *env[] = {NULL};
 
     p = fork();
     if (p == 0) {
@@ -518,9 +551,9 @@ bool spawn(struct PTY *pty)
         dup2(pty->slave, 2);
         close(pty->slave);
 
-        putenv("TERM=xterm-256color");
+        //putenv("TERM=xterm-256color");
 
-        execle(SHELL, "-" SHELL, NULL, env);
+        execlp(SHELL, "-"SHELL, NULL);
         return false;
     }
     else if (p > 0) {
@@ -557,7 +590,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
 
     switch (op) {
       case 'm':
-        break;
+        //break;
       default:
         printf("Processing CSI '%s' op %c\n", buf, op);
     }
@@ -618,6 +651,18 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
               case 37:
                 x11->sgr_fg_col = x11->col_os[arg - 30];
                 break;
+              case 38:
+                arg             = atoi(arg_s);
+                arg_s           = strtok(NULL, ";");
+                if (arg == 5) {
+                    arg             = atoi(arg_s);
+                    arg_s           = strtok(NULL, ";");
+                    x11->sgr_fg_col = x11->col_256[arg];
+                }
+                else {
+                    exit(1);
+                }
+                break;
               case 40:
               case 41:
               case 42:
@@ -627,6 +672,18 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
               case 46:
               case 47:
                 x11->sgr_bg_col = x11->col_os[arg - 40];
+                break;
+              case 48:
+                arg             = atoi(arg_s);
+                arg_s           = strtok(NULL, ";");
+                if (arg == 5) {
+                    arg             = atoi(arg_s);
+                    arg_s           = strtok(NULL, ";");
+                    x11->sgr_bg_col = x11->col_256[arg];
+                }
+                else {
+                    exit(1);
+                }
                 break;
               case 91:
               case 92:
@@ -669,10 +726,9 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
       } break;
       case 'c': {
         if (buf[0] == '>') {
-            const char* reply = "\e[?63;1;2;4;6;9;15;22;29c";
+            const char* reply = "\e[>77;20805;0c";
             int  num = strlen(reply);
-            int ignore;
-                ignore = write(pty->master, reply, num);
+            int         ignore = write(pty->master, reply, num);
             (void)ignore;
         }
         else {
@@ -746,9 +802,11 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             printf("h arg1 %d", arg1);
             arg_s    = strtok(NULL, ";");
             switch (arg1) {
-              case 1: case 12: {
+              case 1: case 12: case 1006: case 1002: case 5:{
                 //  P s = 1 → Application Cursor Keys (DECCKM)
                 //  P s = 1 2 → Start Blinking Cursor (att610) 
+                // 1006,1002 mouse mode shenannigans
+                // 5 reverse video?
               } break;
               case 25: {
                 //        P s = 2 5 → Show Cursor (DECTCEM)
@@ -768,6 +826,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                 //                        and 1048 modes.
                 //                        Use this with terminfo-based
                 //                        applications rather than the 47 mode.
+                /*
                 for (struct cell *cur = x11->buf;
                      cur < x11->buf + x11->buf_w * x11->buf_h;
                      ++cur) {
@@ -775,6 +834,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                     cur->fg = x11->col_fg;
                     cur->bg = x11->col_bg;
                 }
+                */
 
                 struct cell *tmp = x11->buf;
 
@@ -831,6 +891,37 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             dest->bg = x11->col_bg;
         }
       } break;
+      case 'n': {
+        // Device Status Report
+        int arg = atoi(buf);
+        if (arg == 6) {
+          char command[20];
+          size_t len;
+
+          len = snprintf(command,
+                         sizeof(command),
+                         "\e[%d;%dR",
+                         x11->buf_x + 1,
+                         x11->buf_y + 1);
+
+          int writ = write(pty->master, command, len);
+          (void) writ;
+        }
+        else if (arg == 5) {
+          char command[20];
+          size_t len;
+
+          len = snprintf(command,
+                         sizeof(command),
+                         "\e[0n");
+
+          int writ = write(pty->master, command, len);
+          (void) writ;
+        }
+        else {
+            exit(1);
+        }
+      } break;
       default: {
         exit(1);
       } break;
@@ -857,6 +948,7 @@ int run(struct PTY *pty, struct X11 *x11)
     bool   read_escape_mode = false;
     bool   read_csi         = false;
     bool   read_osi         = false;
+    bool   read_charset     = false;
 
     char   csi_buf[20];
     size_t csi_buf_i = 0;
@@ -926,6 +1018,7 @@ int run(struct PTY *pty, struct X11 *x11)
                     // Application Keypad
                     break;
                   case ']':
+                    printf("OSI Start\n");
                     read_osi  = true;
                     osi_buf_i = 0;
                     break;
@@ -938,12 +1031,40 @@ int run(struct PTY *pty, struct X11 *x11)
                     break;
                   case '>': {  //  Normal Keypad (DECPNM)
                   } break;
+                  case '(': { 
+                    //  ESC ( C   Designate G0 Character Set (ISO 2022)
+                    read_charset = true;
+                  } break;
+                  case '7': { // save cursor
+                  } break;
                   default:
                     printf("Escape code unknown '%c' (%x)\n",
                            (int)buf[0],
                            (int)0xFF & buf[0]);
                     exit(1);
                 }
+            }
+            else if (read_charset){
+              read_charset = false;
+              switch(buf[0]){
+                case '0':
+                case 'A':
+                case 'B':
+                case '4':
+                case 'C':
+                case '5':
+                case 'R':
+                case 'Q':
+                case 'K':
+                case 'Y':
+                case 'E':
+                case '6':
+                case 'Z':
+                case 'H':
+                case '7':
+                case '=': {
+                } break;
+              }
             }
             else if (read_csi) {
                 csi_buf[csi_buf_i] = buf[0];
