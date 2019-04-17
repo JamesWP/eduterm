@@ -48,13 +48,45 @@ static struct RGB col_os_vals[8 + 8] = {{0, 0, 0},         // black
                                         {0, 255, 255},     // bright cyan
                                         {255, 255, 255}};  // bright white
 
+static unsigned char grayramp[24] = {1,  2,  3,  5,  6,  7,  8,  9,
+                                     11, 12, 13, 14, 16, 17, 18, 19,
+                                     20, 22, 23, 24, 25, 27, 28, 29};
+
+static unsigned char colorramp[6] = {0, 12, 16, 21, 26, 31};
+
 #define col_os_length (sizeof(col_os_vals) / sizeof(col_os_vals[0]))
 
 struct cell {
     wchar_t       g;
     unsigned long fg;
     unsigned long bg;
+    bool          dirty;
 };
+
+bool equals(struct cell* a, struct cell* b)
+{
+    if (a == b)
+        return true;
+    if (a == NULL)
+        return false;
+    if (a->g != b->g)
+        return false;
+    if (a->fg != b->fg)
+        return false;
+    if (a->bg != b->bg)
+        return false;
+    
+    return true;
+}
+
+void copy(struct cell* dest, struct cell* source)
+{
+    if (equals(dest, source))
+        return;
+    
+    *dest = *source;
+    dest->dirty = true;
+}
 
 struct X11 {
     int      fd;
@@ -67,9 +99,8 @@ struct X11 {
     unsigned long col_fg, col_bg, col_bk;
     int           w, h;
 
-    XFontStruct *xfont;
     XFontSet     xfontset;
-    int          font_width, font_height;
+    int          font_width, font_height, font_yadg;
 
     struct cell *buf_alt;
     struct cell *buf;
@@ -87,6 +118,48 @@ struct X11 {
     unsigned long col_os[col_os_length];
     unsigned long col_256[256 /* duh */];
 };
+
+void clear(struct X11 *x11, struct cell *c)
+{
+    struct cell backup = *c;
+
+    c->g     = ' ';
+    c->fg    = x11->col_fg;
+    c->bg    = x11->col_bg;
+
+    c->dirty = !equals(&backup, c);
+}
+
+void dirty(struct X11 *x11, struct cell *c)
+{
+    c->dirty = true;
+}
+
+// does not handle moving cursor or wrapping
+void putch(struct X11 *x11, wchar_t g)
+{
+    struct cell *c = x11->buf + x11->buf_y * x11->buf_w + x11->buf_x;
+
+    struct cell backup = *c;
+
+    c->g     = g;
+    c->fg    = x11->sgr_fg_col;
+    c->bg    = x11->sgr_bg_col;
+
+    c->dirty = !equals(&backup, c);
+}
+
+void clear_cells(struct X11* x11, struct cell* begin, struct cell* end)
+{
+    for (; begin != end; ++begin)
+        clear(x11, begin);
+}
+
+void dirty_cells(struct X11* x11, struct cell* begin, struct cell* end)
+{
+    for (; begin != end; ++begin)
+        dirty(x11, begin);
+}
 
 bool term_set_size(struct PTY *pty, struct X11 *x11)
 {
@@ -308,24 +381,29 @@ void x11_redraw(struct X11 *x11)
     int     x, y;
     wchar_t buf[1];
 
-    XSetForeground(x11->dpy, x11->termgc, x11->col_bg);
-    XFillRectangle(x11->dpy, x11->termwin, x11->termgc, 0, 0, x11->w, x11->h);
+//    XSetForeground(x11->dpy, x11->termgc, x11->col_bg);
+//    XFillRectangle(x11->dpy, x11->termwin, x11->termgc, 0, 0, x11->w, x11->h);
 
     for (y = 0; y < x11->buf_h; y++) {
         for (x = 0; x < x11->buf_w; x++) {
             struct cell *c = x11->buf + (y * x11->buf_w + x);
+
+            if (!c->dirty)
+                continue;
+
             buf[0]         = c->g;
+
+            XSetForeground(x11->dpy, x11->termgc, c->bg);
+
+            XFillRectangle(x11->dpy,
+                           x11->termwin,
+                           x11->termgc,
+                           x * x11->font_width,
+                           y * x11->font_height,
+                           x11->font_width,
+                           x11->font_height);
+
             if (!iscntrl(buf[0])) {
-                XSetForeground(x11->dpy, x11->termgc, c->bg);
-
-                XFillRectangle(x11->dpy,
-                               x11->termwin,
-                               x11->termgc,
-                               x * x11->font_width,
-                               y * x11->font_height,
-                               x11->font_width,
-                               x11->font_height);
-
                 XSetForeground(x11->dpy, x11->termgc, c->fg);
 
                 XwcDrawString(x11->dpy,
@@ -333,10 +411,13 @@ void x11_redraw(struct X11 *x11)
                               x11->xfontset,
                               x11->termgc,
                               x * x11->font_width,
-                              y * x11->font_height + x11->xfont->ascent,
+                              y * x11->font_height + x11->font_yadg,
                               buf,
                               1);
             }
+
+            if (x != x11->buf_x || y != x11->buf_y)
+                c->dirty = false;
         }
     }
 
@@ -355,8 +436,7 @@ void x11_redraw(struct X11 *x11)
                    x11->font_width,
                    x11->font_height);
 
-
-    XSync(x11->dpy, False);
+    XFlush(x11->dpy);
 }
 
 bool x11_setup(struct X11 *x11)
@@ -385,6 +465,7 @@ bool x11_setup(struct X11 *x11)
     const char *font;
 
     font = "-*-fixed-medium-*-normal-*-*-140-*-*-*-90-*-";
+    font = "-*-fixed-medium-r-normal-*-13-*-*-*-*-*-*-1";
 
     char **missing_charsets;
     int    num_missing_charsets;
@@ -396,16 +477,11 @@ bool x11_setup(struct X11 *x11)
                                    &num_missing_charsets,
                                    &default_string);
 
-    font       = "fixed";
-    font       = "12x24";
-    font       = "8x16";
-    x11->xfont = XLoadQueryFont(x11->dpy, font);
-    if (x11->xfont == NULL) {
-        fprintf(stderr, "Could not load font\n");
-        return false;
-    }
-    x11->font_width  = XTextWidth(x11->xfont, "m", 1);
-    x11->font_height = x11->xfont->ascent + x11->xfont->descent;
+    XFontSetExtents* ext = XExtentsOfFontSet(x11->xfontset);
+
+    x11->font_width  = ext->max_logical_extent.width;
+    x11->font_height = ext->max_logical_extent.height;
+    x11->font_yadg   = -ext->max_logical_extent.y;
 
     cmap = DefaultColormap(x11->dpy, x11->screen);
 
@@ -432,9 +508,9 @@ bool x11_setup(struct X11 *x11)
 
     for (int i = 0; i < (int)col_os_length; i++) {
         XColor c;
-        c.red   = col_os_vals[i].r * 256;
-        c.green = col_os_vals[i].g * 256;
-        c.blue  = col_os_vals[i].b * 256;
+        c.red   = col_os_vals[i].r * 255;
+        c.green = col_os_vals[i].g * 255;
+        c.blue  = col_os_vals[i].b * 255;
         if (!XAllocColor(x11->dpy, cmap, &c)) {
             fprintf(stderr, "Could not load col_os[%d] color\n", i);
             return false;
@@ -448,11 +524,13 @@ bool x11_setup(struct X11 *x11)
         for (int g = 0; g < 6; g++) {
             for (int b = 0; b < 6; b++) {
                 XColor c;
-                c.red   = r * 40 * 256;
-                c.green = g * 40 * 256;
-                c.blue  = b * 40 * 256;
+                c.red   = (colorramp[r] * 255 / 31) * 255;
+                c.green = (colorramp[g] * 255 / 31) * 255;
+                c.blue  = (colorramp[b] * 255 / 31) * 255;
                 if (!XAllocColor(x11->dpy, cmap, &c)) {
-                    fprintf(stderr, "Could not load col_256[%d] color\n", col_map_dest);
+                    fprintf(stderr,
+                            "Could not load col_256[%d] color\n",
+                            (int)col_map_dest);
                     return false;
                 }
                 x11->col_256[col_map_dest++] = c.pixel;
@@ -462,12 +540,11 @@ bool x11_setup(struct X11 *x11)
 
     for (int i = 0; i < 24; i++) {
         XColor c;
-        c.red   = i * 10 * 256;
-        c.green = i * 10 * 256;
-        c.blue  = i * 10 * 256;
+        c.red = c.green = c.blue = (grayramp[i] * 255 / 31) * 255;
         if (!XAllocColor(x11->dpy, cmap, &c)) {
-            fprintf(
-                stderr, "Could not load col_256[%d] color\n", col_map_dest);
+            fprintf(stderr,
+                    "Could not load col_256[%d] color\n",
+                    (int)col_map_dest);
             return false;
         }
         x11->col_256[col_map_dest++] = c.pixel;
@@ -483,11 +560,16 @@ bool x11_setup(struct X11 *x11)
     x11->buf_x = x11->buf_alt_x = 0;
     x11->buf_y = x11->buf_alt_y = 0;
     x11->buf   = calloc(x11->buf_w * x11->buf_h * sizeof(x11->buf[0]), 1);
+    clear_cells(x11, x11->buf, x11->buf + x11->buf_w * x11->buf_h);
+    dirty_cells(x11, x11->buf, x11->buf + x11->buf_w * x11->buf_h);
+
     if (x11->buf == NULL) {
         perror("calloc");
         return false;
     }
     x11->buf_alt = calloc(x11->buf_w * x11->buf_h * sizeof(x11->buf[0]), 1);
+    clear_cells(x11, x11->buf_alt, x11->buf_alt + x11->buf_w * x11->buf_h);
+    dirty_cells(x11, x11->buf_alt, x11->buf_alt + x11->buf_w * x11->buf_h);
     if (x11->buf_alt == NULL) {
         perror("calloc");
         return false;
@@ -611,14 +693,11 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         int num = atoi_range(buf, len - 1, 1);
         for (struct cell *source = lend - num, *dest = lend; source >= cursor;
              --dest, --source)
-            *dest = *source;
+            copy(dest, source);
 
         for (struct cell *bend = cursor + num - 1; bend != cursor - 1;
-             --bend) {
-            bend->g  = ' ';
-            bend->fg = x11->col_fg;
-            bend->bg = x11->col_bg;
-        }
+             --bend) 
+            clear(x11, bend);
 
       } break;
       case 'P': {
@@ -627,7 +706,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         for (struct cell *source = cursor + num, *dest = cursor;
              source != lend + 1;
              ++source, ++dest)
-            *dest = *source;
+            copy(dest, source);
 
       } break;
       case 'm': {
@@ -713,9 +792,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             for (struct cell *a = x11->buf;
                  a != x11->buf + x11->buf_w * x11->buf_h;
                  ++a) {
-                a->g  = ' ';
-                a->fg = x11->col_fg;
-                a->bg = x11->col_bg;
+                clear(x11, a);
             }
             x11->buf_x = 0;
             x11->buf_y = 0;
@@ -759,9 +836,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         switch (arg1) {
           case 0: {
             for (struct cell *a = cursor; a != lend + 1; ++a) {
-                a->g  = ' ';
-                a->fg = x11->col_fg;
-                a->bg = x11->col_bg;
+                clear(x11, a);
             }
           } break;
           default:
@@ -830,9 +905,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                 for (struct cell *cur = x11->buf;
                      cur < x11->buf + x11->buf_w * x11->buf_h;
                      ++cur) {
-                    cur->g  = ' ';
-                    cur->fg = x11->col_fg;
-                    cur->bg = x11->col_bg;
+                    clear(x11, cur);
                 }
                 */
 
@@ -864,12 +937,12 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                          *source = dest + x11->buf_w * (arg1 - 1);
              source < x11->buf + x11->buf_w * x11->buf_h;
              ++source, ++dest)
-            *dest = *source;
+            copy(dest, source);
 
         for (struct cell *dest = x11->buf + x11->buf_w * (x11->buf_h - arg1);
              dest < x11->buf + x11->buf_w * x11->buf_h;
              ++dest)
-            dest->g = ' ', dest->fg = x11->col_fg, dest->bg = x11->col_bg;
+            clear(x11, dest);
       } break;
       case 'L': {
         int arg1;
@@ -881,14 +954,12 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                          *source = dest - x11->buf_w * arg1;
              dest >= lstart;
              --source, --dest)
-            *dest = *source;
+            copy(dest, source);
 
         for (struct cell *dest = lstart, *end = lstart + x11->buf_w * arg1;
              dest < end;
              ++dest) {
-            dest->g  = ' ';
-            dest->fg = x11->col_fg;
-            dest->bg = x11->col_bg;
+            clear(x11, dest);
         }
       } break;
       case 'n': {
@@ -990,8 +1061,7 @@ int run(struct PTY *pty, struct X11 *x11)
                 /* This is not necessarily an error but also happens
                  * when the child exits normally. */
                 fprintf(stderr, "Nothing to read from child: ");
-                perror(NULL);
-                return 1;
+                return 0;
             }
 #if 0
             char printbuf[2];
@@ -1133,11 +1203,7 @@ int run(struct PTY *pty, struct X11 *x11)
                     /* If this is a regular byte, store it and advance
                      * the cursor one cell "to the right". This might
                      * actually wrap to the next line, see below. */
-                    struct cell *c =
-                        x11->buf + x11->buf_y * x11->buf_w + x11->buf_x;
-                    c->g  = glyph;
-                    c->fg = x11->sgr_fg_col;
-                    c->bg = x11->sgr_bg_col;
+                    putch(x11, glyph);
                     x11->buf_x++;
 
                     if (x11->buf_x >= x11->buf_w) {
@@ -1177,13 +1243,12 @@ int run(struct PTY *pty, struct X11 *x11)
                                      *source = dest + w;
                          source < x11->buf + w * (x11->scr_end + 1);
                          ++source, ++dest)
-                        *dest = *source;
+                        copy(dest, source);
 
                     for (struct cell *dest = x11->buf + w * (x11->scr_end);
                          dest < x11->buf + w * (x11->scr_end + 1);
                          ++dest)
-                        dest->g = ' ', dest->fg = x11->col_fg,
-                        dest->bg = x11->col_bg;
+                        clear(x11, dest);
 
                     x11->buf_y = x11->scr_end;
                 }
