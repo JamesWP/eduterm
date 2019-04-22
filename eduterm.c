@@ -67,7 +67,7 @@ bool equals(struct cell* a, struct cell* b)
 {
     if (a == b)
         return true;
-    if (a == NULL)
+    if (a == NULL || b == NULL)
         return false;
     if (a->g != b->g)
         return false;
@@ -81,7 +81,7 @@ bool equals(struct cell* a, struct cell* b)
 
 void copy(struct cell* dest, struct cell* source)
 {
-    if (equals(dest, source))
+    if (dest->dirty || equals(dest, source))
         return;
     
     *dest = *source;
@@ -127,10 +127,10 @@ void clear(struct X11 *x11, struct cell *c)
     c->fg    = x11->col_fg;
     c->bg    = x11->col_bg;
 
-    c->dirty = !equals(&backup, c);
+    c->dirty |= !equals(&backup, c);
 }
 
-void dirty(struct X11 *x11, struct cell *c)
+void dirty(struct cell *c)
 {
     c->dirty = true;
 }
@@ -140,13 +140,10 @@ void putch(struct X11 *x11, wchar_t g)
 {
     struct cell *c = x11->buf + x11->buf_y * x11->buf_w + x11->buf_x;
 
-    struct cell backup = *c;
-
     c->g     = g;
     c->fg    = x11->sgr_fg_col;
     c->bg    = x11->sgr_bg_col;
-
-    c->dirty = !equals(&backup, c);
+    c->dirty = true;
 }
 
 void clear_cells(struct X11* x11, struct cell* begin, struct cell* end)
@@ -154,13 +151,38 @@ void clear_cells(struct X11* x11, struct cell* begin, struct cell* end)
     for (; begin != end; ++begin)
         clear(x11, begin);
 }
-
-void dirty_cells(struct X11* x11, struct cell* begin, struct cell* end)
+void clear_all_cells(struct X11 *x11)
 {
-    for (; begin != end; ++begin)
-        dirty(x11, begin);
+    clear_cells(x11, x11->buf, x11->buf + x11->buf_w * x11->buf_h);
 }
 
+void dirty_cells(struct cell* begin, struct cell* end)
+{
+    for (; begin != end; ++begin)
+        dirty(begin);
+}
+
+void dirty_all_cells(struct X11 *x11)
+{
+    dirty_cells(x11->buf, x11->buf + x11->buf_w * x11->buf_h);
+}
+
+void switch_buffers(struct X11* x11) 
+{
+    struct cell *tmp = x11->buf;
+
+    x11->buf     = x11->buf_alt;
+    x11->buf_alt = tmp;
+
+    int tmpc;
+    tmpc           = x11->buf_x;
+    x11->buf_x     = x11->buf_alt_x;
+    x11->buf_alt_x = tmpc;
+
+    tmpc           = x11->buf_y;
+    x11->buf_y     = x11->buf_alt_y;
+    x11->buf_alt_y = tmpc;
+}
 bool term_set_size(struct PTY *pty, struct X11 *x11)
 {
     struct winsize ws = {
@@ -341,38 +363,6 @@ void print_utf32(wchar_t ch)
     printf("%s", buf);
 }
 
-void x11_key(XKeyEvent *ev, struct PTY *pty)
-{
-    char   buf[32];
-    int    i, num;
-    KeySym ksym;
-
-    num      = XLookupString(ev, buf, sizeof(buf) - 1, &ksym, 0);
-    buf[num] = 0;
-
-    if (IsTtyFunctionOrSpaceKey(ksym)) {
-        // printf("XKeyEvent non character\n");
-    }
-    else if (IsKeypad(ksym) != '\0') {
-        printf("XKeyEvent arrow key\n");
-        num    = 3;
-        buf[0] = (char)27;
-        buf[1] = '[';
-        buf[2] = IsKeypad(ksym);
-    }
-    else {
-        // printf("XKeyEvent string = '%s'\n", buf);
-        //        fflush(stdout);
-        //        write(1, buf, num);
-        //        fflush(stdout);
-        //        printf("'\n");
-    }
-    int ignore;
-    for (i = 0; i < num; i++)
-        ignore = write(pty->master, &buf[i], 1);
-    (void)ignore;
-}
-
 void x11_redraw(struct X11 *x11)
 {
     if (!x11->cur)
@@ -403,21 +393,25 @@ void x11_redraw(struct X11 *x11)
                            x11->font_width,
                            x11->font_height);
 
-            if (!iscntrl(buf[0])) {
-                XSetForeground(x11->dpy, x11->termgc, c->fg);
-
-                XwcDrawString(x11->dpy,
-                              x11->termwin,
-                              x11->xfontset,
-                              x11->termgc,
-                              x * x11->font_width,
-                              y * x11->font_height + x11->font_yadg,
-                              buf,
-                              1);
+            if (iscntrl(buf[0])) {
+                buf[0] = ' ';
             }
 
-            if (x != x11->buf_x || y != x11->buf_y)
-                c->dirty = false;
+            XSetForeground(x11->dpy, x11->termgc, c->fg);
+
+            XwcDrawString(x11->dpy,
+                          x11->termwin,
+                          x11->xfontset,
+                          x11->termgc,
+                          x * x11->font_width,
+                          y * x11->font_height + x11->font_yadg,
+                          buf,
+                          1);
+
+            c->dirty = false;
+
+            if (x == x11->buf_x && y == x11->buf_y)
+                c->dirty = true;
         }
     }
 
@@ -435,9 +429,49 @@ void x11_redraw(struct X11 *x11)
                    x11->buf_y * x11->font_height,
                    x11->font_width,
                    x11->font_height);
-
     XFlush(x11->dpy);
 }
+
+void x11_key(XKeyEvent *ev, struct PTY *pty, struct X11* x11)
+{
+    char   buf[32];
+    int    num;
+    KeySym ksym;
+
+    num      = XLookupString(ev, buf, sizeof(buf) - 1, &ksym, 0);
+    buf[num] = 0;
+
+    if (IsTtyFunctionOrSpaceKey(ksym)) {
+        // printf("XKeyEvent non character\n");
+    }
+    else if (IsKeypad(ksym) != '\0') {
+        printf("XKeyEvent arrow key\n");
+        num    = 3;
+        buf[0] = (char)27;
+        buf[1] = '[';
+        buf[2] = IsKeypad(ksym);
+    }
+    else {
+        // printf("XKeyEvent string = '%s'\n", buf);
+        //        fflush(stdout);
+        //        write(1, buf, num);
+        //        fflush(stdout);
+        //        printf("'\n");
+    }
+
+    switch(ksym) {
+      case XK_Home: {
+        dirty_all_cells(x11);
+        x11_redraw(x11);
+      } break;
+      default: {
+        int ignore = write(pty->master, buf, num);
+        (void)ignore;
+      } break;
+    }
+
+}
+
 
 bool x11_setup(struct X11 *x11)
 {
@@ -560,17 +594,21 @@ bool x11_setup(struct X11 *x11)
     x11->buf_x = x11->buf_alt_x = 0;
     x11->buf_y = x11->buf_alt_y = 0;
     x11->buf   = calloc(x11->buf_w * x11->buf_h * sizeof(x11->buf[0]), 1);
-    clear_cells(x11, x11->buf, x11->buf + x11->buf_w * x11->buf_h);
-    dirty_cells(x11, x11->buf, x11->buf + x11->buf_w * x11->buf_h);
+    clear_all_cells(x11);
+    dirty_all_cells(x11);
 
     if (x11->buf == NULL) {
         perror("calloc");
         return false;
     }
-    x11->buf_alt = calloc(x11->buf_w * x11->buf_h * sizeof(x11->buf[0]), 1);
-    clear_cells(x11, x11->buf_alt, x11->buf_alt + x11->buf_w * x11->buf_h);
-    dirty_cells(x11, x11->buf_alt, x11->buf_alt + x11->buf_w * x11->buf_h);
-    if (x11->buf_alt == NULL) {
+
+    switch_buffers(x11);
+
+    x11->buf   = calloc(x11->buf_w * x11->buf_h * sizeof(x11->buf[0]), 1);
+    clear_all_cells(x11);
+    dirty_all_cells(x11);
+
+    if (x11->buf == NULL) {
         perror("calloc");
         return false;
     }
@@ -909,19 +947,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                 }
                 */
 
-                struct cell *tmp = x11->buf;
-
-                x11->buf     = x11->buf_alt;
-                x11->buf_alt = tmp;
-
-                int tmpc;
-                tmpc           = x11->buf_x;
-                x11->buf_x     = x11->buf_alt_x;
-                x11->buf_alt_x = tmpc;
-
-                tmpc           = x11->buf_y;
-                x11->buf_y     = x11->buf_alt_y;
-                x11->buf_alt_y = tmpc;
+                switch_buffers(x11);
               } break;
               default:
                 exit(1);
@@ -1265,7 +1291,7 @@ int run(struct PTY *pty, struct X11 *x11)
                     x11_redraw(x11);
                     break;
                   case KeyPress:
-                    x11_key(&ev.xkey, pty);
+                    x11_key(&ev.xkey, pty, x11);
                     break;
                 }
             }
