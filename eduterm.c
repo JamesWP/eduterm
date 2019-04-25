@@ -81,10 +81,11 @@ bool equals(struct cell* a, struct cell* b)
 
 void copy(struct cell* dest, struct cell* source)
 {
-    if (dest->dirty || equals(dest, source))
+    if (equals(dest, source))
         return;
     
     *dest = *source;
+    
     dest->dirty = true;
 }
 
@@ -123,7 +124,7 @@ void clear(struct X11 *x11, struct cell *c)
 {
     struct cell backup = *c;
 
-    c->g     = ' ';
+    c->g     = L' ';
     c->fg    = x11->col_fg;
     c->bg    = x11->col_bg;
 
@@ -151,6 +152,7 @@ void clear_cells(struct X11* x11, struct cell* begin, struct cell* end)
     for (; begin != end; ++begin)
         clear(x11, begin);
 }
+
 void clear_all_cells(struct X11 *x11)
 {
     clear_cells(x11, x11->buf, x11->buf + x11->buf_w * x11->buf_h);
@@ -228,6 +230,8 @@ bool pt_pair(struct PTY *pty)
         perror("posix_openpt");
         return false;
     }
+
+    fcntl(pty->master, F_SETFL, fcntl(pty->master, F_GETFL) | O_NONBLOCK);
 
     /* grantpt() and unlockpt() are housekeeping functions that have to
      * be called before we can open the slave FD. Refer to the manpages
@@ -369,7 +373,6 @@ void x11_redraw(struct X11 *x11)
         return;
 
     int     x, y;
-    wchar_t buf[1];
 
 //    XSetForeground(x11->dpy, x11->termgc, x11->col_bg);
 //    XFillRectangle(x11->dpy, x11->termwin, x11->termgc, 0, 0, x11->w, x11->h);
@@ -378,10 +381,11 @@ void x11_redraw(struct X11 *x11)
         for (x = 0; x < x11->buf_w; x++) {
             struct cell *c = x11->buf + (y * x11->buf_w + x);
 
-            if (!c->dirty)
-                continue;
+            if (x != x11->buf_x && y != x11->buf_y)
+                if (!c->dirty)
+                    continue;
 
-            buf[0]         = c->g;
+            wchar_t g = c->g;
 
             XSetForeground(x11->dpy, x11->termgc, c->bg);
 
@@ -393,9 +397,11 @@ void x11_redraw(struct X11 *x11)
                            x11->font_width,
                            x11->font_height);
 
-            if (iscntrl(buf[0])) {
-                buf[0] = ' ';
+#if 0
+            if (iscntrl(g)) {
+                g = ' ';
             }
+#endif
 
             XSetForeground(x11->dpy, x11->termgc, c->fg);
 
@@ -405,12 +411,12 @@ void x11_redraw(struct X11 *x11)
                           x11->termgc,
                           x * x11->font_width,
                           y * x11->font_height + x11->font_yadg,
-                          buf,
+                          &g,
                           1);
 
-            c->dirty = false;
-
-            if (x == x11->buf_x && y == x11->buf_y)
+            if (x != x11->buf_x && y != x11->buf_y)
+                c->dirty = false;
+            else
                 c->dirty = true;
         }
     }
@@ -442,27 +448,59 @@ void x11_key(XKeyEvent *ev, struct PTY *pty, struct X11* x11)
     buf[num] = 0;
 
     if (IsTtyFunctionOrSpaceKey(ksym)) {
-        // printf("XKeyEvent non character\n");
+        printf("XKeyEvent non character = (%x) len() == %d\n", 0xFF & buf[0], num);
+        if(buf[0] == '\177'){
+            // backspace
+            num = snprintf(buf, sizeof(buf), "\33[3~");
+        }
     }
     else if (IsKeypad(ksym) != '\0') {
         printf("XKeyEvent arrow key\n");
-        num    = 3;
-        buf[0] = (char)27;
-        buf[1] = '[';
-        buf[2] = IsKeypad(ksym);
+        num = snprintf(buf, sizeof(buf), "\33[[%c", IsKeypad(ksym));
     }
     else {
-        // printf("XKeyEvent string = '%s'\n", buf);
-        //        fflush(stdout);
-        //        write(1, buf, num);
-        //        fflush(stdout);
-        //        printf("'\n");
+        printf("XKeyEvent string = '%s'\n", buf);
     }
 
     switch(ksym) {
       case XK_Home: {
         dirty_all_cells(x11);
+        clear_all_cells(x11);
         x11_redraw(x11);
+      } break;
+      case XK_Insert: {
+        printf("\n");
+        char row[x11->buf_w + 1];
+        row[x11->buf_w] = '\0';
+
+        for (int x = 0; x < x11->buf_w; x++)
+            row[x] = '_';
+
+        printf(" . %s . \n", row);
+
+        for(int y=0;y<x11->buf_h; y++){
+            for (int x = 0; x < x11->buf_w; x++) {
+                struct cell *c = x11->buf + (x11->buf_w * y + x);
+                if (iswspace(c->g))
+                    row[x] = ' ';
+                else if (iswcntrl(c->g))
+                    row[x] = ' ';
+                else if (iswcntrl(c->g))
+                    row[x] = ' ';
+                else if (iswprint(c->g))
+                    row[x] = c->g;
+                else
+                    row[x] = '?';
+            }
+            printf(" | %s | \n", row);
+        }
+
+        for (int x = 0; x < x11->buf_w; x++)
+            row[x] = '-';
+
+        printf(" ` %s ` \n", row);
+
+        printf("\n");
       } break;
       default: {
         int ignore = write(pty->master, buf, num);
@@ -590,7 +628,7 @@ bool x11_setup(struct X11 *x11)
      *
      * buf_x, buf_y will be the current cursor position. */
     x11->buf_w = 80;
-    x11->buf_h = 25;
+    x11->buf_h = 45;
     x11->buf_x = x11->buf_alt_x = 0;
     x11->buf_y = x11->buf_alt_y = 0;
     x11->buf   = calloc(x11->buf_w * x11->buf_h * sizeof(x11->buf[0]), 1);
@@ -710,7 +748,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
 
     switch (op) {
       case 'm':
-        //break;
+        break;
       default:
         printf("Processing CSI '%s' op %c\n", buf, op);
     }
@@ -745,6 +783,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
              source != lend + 1;
              ++source, ++dest)
             copy(dest, source);
+        clear_cells(x11 ,lend - (num-1), lend +1);
 
       } break;
       case 'm': {
@@ -824,7 +863,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         }
       } break;
       case 'J': {
-        int arg1;
+        int arg1 = 0;
         sscanf(buf, "%dJ", &arg1);
         if (arg1 == 2 || arg1 == 3) {
             for (struct cell *a = x11->buf;
@@ -851,18 +890,15 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         }
       } break;
       case 'C': {
-        int arg1;
+        int arg1 = 0;
         sscanf(buf, "%dC", &arg1);
         x11->buf_x += arg1;
         x11->buf_x = x11->buf_x < x11->buf_w - 1 ? x11->buf_x : x11->buf_w - 1;
       } break;
       case 'H': {
-        int r, c;
+        int r = 1; int c = 1;
         if (len > 1) {
             sscanf(buf, "%d;%dH", &r, &c);
-        }
-        else {
-            r = c = 1;
         }
         x11->buf_x = c - 1;
         x11->buf_y = r - 1;
@@ -903,6 +939,12 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             x11->cur = false;
             printf("Hiding Cursor\n");
         }
+        else if (arg1 == 12) {
+            // stop cursor blinking
+        }
+        //else {
+        //    exit(1);
+        //}
       } break;
       case 'h': {
         //  CSI ? P m h   DEC Private Mode Set (DECSET)
@@ -912,10 +954,13 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         char *arg_s = strtok(buf+1, ";");
         while (arg_s) {
             int arg1 = atoi(arg_s);
-            printf("h arg1 %d", arg1);
             arg_s    = strtok(NULL, ";");
             switch (arg1) {
-              case 1: case 12: case 1006: case 1002: case 5:{
+              case 1:
+              case 12:
+              case 1006:
+              case 1002:
+              case 5: {
                 //  P s = 1 → Application Cursor Keys (DECCKM)
                 //  P s = 1 2 → Start Blinking Cursor (att610) 
                 // 1006,1002 mouse mode shenannigans
@@ -971,22 +1016,23 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             clear(x11, dest);
       } break;
       case 'L': {
-        int arg1;
-        sscanf(buf, "%dM", &arg1);
+        int arg1 = 1;
+        sscanf(buf, "%dL", &arg1);
         // insert arg1 lines
+        printf("Insert %d lines\n", arg1);
         struct cell *scroll_end = x11->buf + (x11->scr_end + 1) * x11->buf_w;
 
         for (struct cell *dest   = scroll_end,
-                         *source = dest - x11->buf_w * arg1;
-             dest >= lstart;
+                         *source = scroll_end - x11->buf_w * arg1;
+             source >= lstart;
              --source, --dest)
             copy(dest, source);
 
         for (struct cell *dest = lstart, *end = lstart + x11->buf_w * arg1;
              dest < end;
-             ++dest) {
+             ++dest) 
             clear(x11, dest);
-        }
+
       } break;
       case 'n': {
         // Device Status Report
@@ -1040,6 +1086,7 @@ int run(struct PTY *pty, struct X11 *x11)
     fd_set active;
     fd_set readable;
     XEvent ev;
+    char   _buf[1];
     char   buf[1];
     bool   just_wrapped     = false;
     bool   read_escape_mode = false;
@@ -1083,12 +1130,13 @@ int run(struct PTY *pty, struct X11 *x11)
         }
 
         if (FD_ISSET(pty->master, &readable)) {
-            if (read(pty->master, buf, 1) <= 0) {
-                /* This is not necessarily an error but also happens
-                 * when the child exits normally. */
-                fprintf(stderr, "Nothing to read from child: ");
-                return 0;
+            ssize_t num = read(pty->master, _buf, sizeof(_buf));
+            if (num == -1) {
+                break;
             }
+
+            for (size_t i = 0; i < (size_t)num; i++) {
+              buf[0] = _buf[i];
 #if 0
             char printbuf[2];
 
@@ -1103,145 +1151,146 @@ int run(struct PTY *pty, struct X11 *x11)
                    (int)buf[0],
                    (unsigned char)buf[0]);
 #endif
-            if (read_escape_mode) {
-                read_escape_mode = false;
-                switch (buf[0]) {
-                  case '[':
-                    read_csi  = true;
-                    csi_buf_i = 0;
-                    break;
-                  case '=':
-                    // Application Keypad
-                    break;
-                  case ']':
-                    printf("OSI Start\n");
-                    read_osi  = true;
-                    osi_buf_i = 0;
-                    break;
-                  case '\\':
-                    if (read_osi) {
+                if (read_escape_mode) {
+                    read_escape_mode = false;
+                    switch (buf[0]) {
+                      case '[':
+                        read_csi  = true;
+                        csi_buf_i = 0;
+                        break;
+                      case '=':
+                        // Application Keypad
+                        break;
+                      case ']':
+                        printf("OSI Start\n");
+                        read_osi  = true;
+                        osi_buf_i = 0;
+                        break;
+                      case '\\':
+                        if (read_osi) {
+                            osi_buf[osi_buf_i] = '\0';
+                            process_osi(osi_buf, osi_buf_i, x11, pty);
+                            read_osi = false;
+                        }
+                        break;
+                      case '>': {  //  Normal Keypad (DECPNM)
+                      } break;
+                      case '(': {
+                        //  ESC ( C   Designate G0 Character Set (ISO 2022)
+                        read_charset = true;
+                      } break;
+                      case '7': {  // save cursor
+                      } break;
+                      default:
+                        printf("Escape code unknown '%c' (%x)\n",
+                               (int)buf[0],
+                               (int)0xFF & buf[0]);
+                        exit(1);
+                    }
+                }
+                else if (read_charset) {
+                    read_charset = false;
+                    switch (buf[0]) {
+                      case '0':
+                      case 'A':
+                      case 'B':
+                      case '4':
+                      case 'C':
+                      case '5':
+                      case 'R':
+                      case 'Q':
+                      case 'K':
+                      case 'Y':
+                      case 'E':
+                      case '6':
+                      case 'Z':
+                      case 'H':
+                      case '7':
+                      case '=': {
+                      } break;
+                    }
+                }
+                else if (read_csi) {
+                    csi_buf[csi_buf_i] = buf[0];
+                    csi_buf_i++;
+                    if (is_final_csi_byte(buf[0])) {
+                        csi_buf[csi_buf_i] = '\0';
+                        process_csi(csi_buf, csi_buf_i - 1, x11, pty);
+                        read_csi = false;
+                    }
+                }
+                else if (read_osi) {
+                    osi_buf[osi_buf_i] = buf[0];
+                    osi_buf_i++;
+                    if (is_final_osi_byte(buf[0])) {
                         osi_buf[osi_buf_i] = '\0';
-                        process_osi(osi_buf, osi_buf_i, x11, pty);
+                        process_osi(osi_buf, osi_buf_i - 1, x11, pty);
                         read_osi = false;
                     }
-                    break;
-                  case '>': {  //  Normal Keypad (DECPNM)
-                  } break;
-                  case '(': { 
-                    //  ESC ( C   Designate G0 Character Set (ISO 2022)
-                    read_charset = true;
-                  } break;
-                  case '7': { // save cursor
-                  } break;
-                  default:
-                    printf("Escape code unknown '%c' (%x)\n",
-                           (int)buf[0],
-                           (int)0xFF & buf[0]);
-                    exit(1);
                 }
-            }
-            else if (read_charset){
-              read_charset = false;
-              switch(buf[0]){
-                case '0':
-                case 'A':
-                case 'B':
-                case '4':
-                case 'C':
-                case '5':
-                case 'R':
-                case 'Q':
-                case 'K':
-                case 'Y':
-                case 'E':
-                case '6':
-                case 'Z':
-                case 'H':
-                case '7':
-                case '=': {
-                } break;
-              }
-            }
-            else if (read_csi) {
-                csi_buf[csi_buf_i] = buf[0];
-                csi_buf_i++;
-                if (is_final_csi_byte(buf[0])) {
-                    csi_buf[csi_buf_i] = '\0';
-                    process_csi(csi_buf, csi_buf_i - 1, x11, pty);
-                    read_csi = false;
-                }
-            }
-            else if (read_osi) {
-                osi_buf[osi_buf_i] = buf[0];
-                osi_buf_i++;
-                if (is_final_osi_byte(buf[0])) {
-                    osi_buf[osi_buf_i] = '\0';
-                    process_osi(osi_buf, osi_buf_i - 1, x11, pty);
-                    read_osi = false;
-                }
-            }
-            else if (buf[0] == '\r') {
-                /* "Carriage returns" are probably the most simple
+                else if (buf[0] == '\r') {
+                    /* "Carriage returns" are probably the most simple
                  * "terminal command": They just make the cursor jump
                  * back to the very first column. */
-                x11->buf_x = 0;
-            }
-            else if (buf[0] == (char)0x08) {
-                printf("Backspace\n");
-                if (x11->buf_x != 0)
-                    x11->buf_x -= 1;
-            }
-            else if (buf[0] == (char)0x07) {
-                printf("Bell\n");
-            }
-            else {
-                if (buf[0] == (char)27) {
-                    read_escape_mode = true;
+                    x11->buf_x = 0;
                 }
-                else if (buf[0] != '\n') {
-                    wchar_t glyph = buf[0];
-                    if ((buf[0] & 0x80) != 0) {
-                        // utf8 character
-                        size_t n = 1;
-                        if ((buf[0] & 0xE0) == 0xC0)
-                            n = 1;
-                        else if ((buf[0] & 0xF0) == 0xE0)
-                            n = 2;
-                        else if ((buf[0] & 0xF8) == 0xF0)
-                            n = 3;
+                else if (buf[0] == (char)0x08) {
+                    printf("Backspace\n");
+                    if (x11->buf_x != 0)
+                        x11->buf_x -= 1;
+                }
+                else if (buf[0] == (char)0x07) {
+                    printf("Bell\n");
+                }
+                else {
+                    if (buf[0] == (char)27) {
+                        read_escape_mode = true;
+                    }
+                    else if (buf[0] != '\n') {
+                        wchar_t glyph = buf[0];
+                        if ((buf[0] & 0x80) != 0) {
+                            // utf8 character
+                            size_t n = 1;
+                            if ((buf[0] & 0xE0) == 0xC0)
+                                n = 1;
+                            else if ((buf[0] & 0xF0) == 0xE0)
+                                n = 2;
+                            else if ((buf[0] & 0xF8) == 0xF0)
+                                n = 3;
 
-                        char utf8[n + 1];
-                        utf8[0] = buf[0];
-                        if (read(pty->master, utf8 + 1, n) <= 0) {
-                            /* This is not necessarily an error but also happens
+                            char utf8[n + 1];
+                            utf8[0] = buf[0];
+                            if (read(pty->master, utf8 + 1, n) <= 0) {
+                                /* This is not necessarily an error but also happens
                              * when the child exits normally. */
-                            fprintf(stderr, "Nothing to read from child: ");
-                            perror(NULL);
-                            return 1;
+                                fprintf(stderr,
+                                        "Nothing to read from child: ");
+                                perror(NULL);
+                                return 1;
+                            }
+
+                            glyph = utf8_to_utf32(utf8, n + 1);
                         }
 
-                        glyph = utf8_to_utf32(utf8, n + 1);
-                    }
+                        // printf("Glyph received '"); print_utf32(glyph);
+                        // printf("'\n");
 
-                    // printf("Glyph received '"); print_utf32(glyph);
-                    // printf("'\n");
-
-                    /* If this is a regular byte, store it and advance
+                        /* If this is a regular byte, store it and advance
                      * the cursor one cell "to the right". This might
                      * actually wrap to the next line, see below. */
-                    putch(x11, glyph);
-                    x11->buf_x++;
+                        putch(x11, glyph);
+                        x11->buf_x++;
 
-                    if (x11->buf_x >= x11->buf_w) {
-                        x11->buf_x = 0;
-                        x11->buf_y++;
-                        just_wrapped = true;
+                        if (x11->buf_x >= x11->buf_w) {
+                            x11->buf_x = 0;
+                            x11->buf_y++;
+                            just_wrapped = true;
+                        }
+                        else
+                            just_wrapped = false;
                     }
-                    else
-                        just_wrapped = false;
-                }
-                else if (!just_wrapped) {
-                    /* We read a newline and we did *not* implicitly
+                    else if (!just_wrapped) {
+                        /* We read a newline and we did *not* implicitly
                      * wrap to the next line with the last byte we read.
                      * This means we must *now* advance to the next
                      * line.
@@ -1253,30 +1302,32 @@ int run(struct PTY *pty, struct X11 *x11)
                      * wrap to the next line implicitly, so that
                      * additional newline could cause the cursor to jump
                      * to the next line *again*.) */
-                    x11->buf_y++;
-                    just_wrapped = false;
-                }
+                        x11->buf_y++;
+                        just_wrapped = false;
+                    }
 
-                /* We now check if "the next line" is actually outside
+                    /* We now check if "the next line" is actually outside
                  * of the buffer. If it is, we shift the entire content
                  * one line up and then stay in the very last line.
                  *
                  * After the memmove(), the last line still has the old
                  * content. We must clear it. */
-                if (x11->buf_y > x11->scr_end) {
-                    size_t w = x11->buf_w;
-                    for (struct cell *dest   = x11->buf + (w * x11->scr_begin),
-                                     *source = dest + w;
-                         source < x11->buf + w * (x11->scr_end + 1);
-                         ++source, ++dest)
-                        copy(dest, source);
+                    if (x11->buf_y > x11->scr_end) {
+                        size_t w = x11->buf_w;
+                        for (struct cell *
+                                 dest   = x11->buf + (w * x11->scr_begin),
+                                *source = dest + w;
+                             source < x11->buf + w * (x11->scr_end + 1);
+                             ++source, ++dest)
+                            copy(dest, source);
 
-                    for (struct cell *dest = x11->buf + w * (x11->scr_end);
-                         dest < x11->buf + w * (x11->scr_end + 1);
-                         ++dest)
-                        clear(x11, dest);
+                        for (struct cell *dest = x11->buf + w * (x11->scr_end);
+                             dest < x11->buf + w * (x11->scr_end + 1);
+                             ++dest)
+                            clear(x11, dest);
 
-                    x11->buf_y = x11->scr_end;
+                        x11->buf_y = x11->scr_end;
+                    }
                 }
             }
 
@@ -1288,6 +1339,7 @@ int run(struct PTY *pty, struct X11 *x11)
                 XNextEvent(x11->dpy, &ev);
                 switch (ev.type) {
                   case Expose:
+                    dirty_all_cells(x11);
                     x11_redraw(x11);
                     break;
                   case KeyPress:
