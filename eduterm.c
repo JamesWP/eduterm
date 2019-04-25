@@ -960,11 +960,13 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
               case 12:
               case 1006:
               case 1002:
-              case 5: {
+              case 5: 
+              case 2004: {
                 //  P s = 1 → Application Cursor Keys (DECCKM)
                 //  P s = 1 2 → Start Blinking Cursor (att610) 
                 // 1006,1002 mouse mode shenannigans
                 // 5 reverse video?
+		// 2004 bracketed paste mode
               } break;
               case 25: {
                 //        P s = 2 5 → Show Cursor (DECTCEM)
