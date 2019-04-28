@@ -185,6 +185,7 @@ void switch_buffers(struct X11* x11)
     x11->buf_y     = x11->buf_alt_y;
     x11->buf_alt_y = tmpc;
 }
+
 bool term_set_size(struct PTY *pty, struct X11 *x11)
 {
     struct winsize ws = {
@@ -372,19 +373,18 @@ void x11_redraw(struct X11 *x11)
     if (!x11->cur)
         return;
 
+    size_t total = 0;
     int     x, y;
-
-//    XSetForeground(x11->dpy, x11->termgc, x11->col_bg);
-//    XFillRectangle(x11->dpy, x11->termwin, x11->termgc, 0, 0, x11->w, x11->h);
 
     for (y = 0; y < x11->buf_h; y++) {
         for (x = 0; x < x11->buf_w; x++) {
             struct cell *c = x11->buf + (y * x11->buf_w + x);
 
-            if (x != x11->buf_x && y != x11->buf_y)
+            if (x != x11->buf_x || y != x11->buf_y)
                 if (!c->dirty)
                     continue;
 
+            total++;
             wchar_t g = c->g;
 
             XSetForeground(x11->dpy, x11->termgc, c->bg);
@@ -414,10 +414,9 @@ void x11_redraw(struct X11 *x11)
                           &g,
                           1);
 
-            if (x != x11->buf_x && y != x11->buf_y)
-                c->dirty = false;
-            else
+            if (x == x11->buf_x && y == x11->buf_y)
                 c->dirty = true;
+            else c->dirty = false;
         }
     }
 
@@ -436,6 +435,8 @@ void x11_redraw(struct X11 *x11)
                    x11->font_width,
                    x11->font_height);
     XFlush(x11->dpy);
+
+    // printf("Total cells drawn %d\n", (int)total);
 }
 
 void x11_key(XKeyEvent *ev, struct PTY *pty, struct X11* x11)
@@ -725,7 +726,7 @@ bool spawn(struct PTY *pty)
 
 bool is_final_csi_byte(char b)
 {
-    return b >= 0x40 && b <= 0x73;
+    return b >= 0x40 && b <= 0x7c;
 }
 
 bool is_final_osi_byte(char b)
@@ -986,14 +987,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                 //                        and 1048 modes.
                 //                        Use this with terminfo-based
                 //                        applications rather than the 47 mode.
-                /*
-                for (struct cell *cur = x11->buf;
-                     cur < x11->buf + x11->buf_w * x11->buf_h;
-                     ++cur) {
-                    clear(x11, cur);
-                }
-                */
-
+                clear_all_cells(x11);
                 switch_buffers(x11);
               } break;
               default:
@@ -1002,18 +996,18 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         }
       } break;
       case 'M': {
-        int arg1;
+        int arg1 = 1;
         sscanf(buf, "%dM", &arg1);
         // delete arg1 lines
 
         for (struct cell *dest   = lstart,
-                         *source = dest + x11->buf_w * (arg1 - 1);
-             source < x11->buf + x11->buf_w * x11->buf_h;
+                         *source = dest + x11->buf_w * arg1;
+             source < x11->buf + x11->buf_w * (1+x11->scr_end);
              ++source, ++dest)
             copy(dest, source);
 
-        for (struct cell *dest = x11->buf + x11->buf_w * (x11->buf_h - arg1);
-             dest < x11->buf + x11->buf_w * x11->buf_h;
+        for (struct cell *dest = x11->buf + x11->buf_w * (1+x11->scr_end - arg1);
+             dest < x11->buf + x11->buf_w * (1+x11->scr_end);
              ++dest)
             clear(x11, dest);
       } break;
@@ -1067,6 +1061,12 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             exit(1);
         }
       } break;
+      case 't': {
+        // IGNORE
+        // Window manipulation (from dtterm, as well as extensions). These controls 
+        //      may be disabled using the allowWindowOps resource. Valid values for 
+        //      the first (and any additional parameters) are:
+      } break;      	
       default: {
         exit(1);
       } break;
@@ -1091,10 +1091,12 @@ int run(struct PTY *pty, struct X11 *x11)
     char   _buf[1];
     char   buf[1];
     bool   just_wrapped     = false;
+    bool   add_newline      = false;
     bool   read_escape_mode = false;
     bool   read_csi         = false;
     bool   read_osi         = false;
     bool   read_charset     = false;
+    bool   read_utf8        = false;
 
     char   csi_buf[20];
     size_t csi_buf_i = 0;
@@ -1102,7 +1104,13 @@ int run(struct PTY *pty, struct X11 *x11)
     char   osi_buf[200];
     size_t osi_buf_i = 0;
 
+    size_t utf8_size = 0; 
+    char utf8_buf[4];
+    size_t utf8_idx = 0;
+
     struct timeval timeout;
+
+    bool draw = false;
 
     maxfd = pty->master > x11->fd ? pty->master : x11->fd;
 
@@ -1133,25 +1141,26 @@ int run(struct PTY *pty, struct X11 *x11)
 
         if (FD_ISSET(pty->master, &readable)) {
             ssize_t num = read(pty->master, _buf, sizeof(_buf));
+
             if (num == -1) {
                 break;
             }
 
             for (size_t i = 0; i < (size_t)num; i++) {
-              buf[0] = _buf[i];
-#if 0
-            char printbuf[2];
+                buf[0] = _buf[i];
+#if 1
+                char printbuf[2];
 
-            if (buf[0] >= 32 && buf[0] <= 126)
-                printbuf[0] = buf[0];
-            else
-                printbuf[0] = '?';
+                if (buf[0] >= 32 && buf[0] <= 126)
+                    printbuf[0] = buf[0];
+                else
+                    printbuf[0] = '?';
 
-            printbuf[1] = '\0';
-            printf("Child sent '%s' (%d) (0x%x)\n",
-                   printbuf,
-                   (int)buf[0],
-                   (unsigned char)buf[0]);
+                printbuf[1] = '\0';
+                printf("Child sent '%s' (%d) (0x%x)\n",
+                       printbuf,
+                       (int)buf[0],
+                       (unsigned char)buf[0]);
 #endif
                 if (read_escape_mode) {
                     read_escape_mode = false;
@@ -1172,6 +1181,7 @@ int run(struct PTY *pty, struct X11 *x11)
                         if (read_osi) {
                             osi_buf[osi_buf_i] = '\0';
                             process_osi(osi_buf, osi_buf_i, x11, pty);
+                            draw = true;
                             read_osi = false;
                         }
                         break;
@@ -1219,6 +1229,7 @@ int run(struct PTY *pty, struct X11 *x11)
                         csi_buf[csi_buf_i] = '\0';
                         process_csi(csi_buf, csi_buf_i - 1, x11, pty);
                         read_csi = false;
+                        draw = true;
                     }
                 }
                 else if (read_osi) {
@@ -1228,6 +1239,7 @@ int run(struct PTY *pty, struct X11 *x11)
                         osi_buf[osi_buf_i] = '\0';
                         process_osi(osi_buf, osi_buf_i - 1, x11, pty);
                         read_osi = false;
+                        draw = true;
                     }
                 }
                 else if (buf[0] == '\r') {
@@ -1235,85 +1247,71 @@ int run(struct PTY *pty, struct X11 *x11)
                  * "terminal command": They just make the cursor jump
                  * back to the very first column. */
                     x11->buf_x = 0;
+                    draw = true;
                 }
                 else if (buf[0] == (char)0x08) {
                     printf("Backspace\n");
+                    draw = true;
                     if (x11->buf_x != 0)
                         x11->buf_x -= 1;
                 }
                 else if (buf[0] == (char)0x07) {
                     printf("Bell\n");
                 }
-                else {
-                    if (buf[0] == (char)27) {
-                        read_escape_mode = true;
+                else if (buf[0] == (char)27) {
+                    read_escape_mode = true;
+                }
+                else if (buf[0] == '\n') {
+                    if (!just_wrapped) { 
+                        add_newline = true; 
+                        draw = true; 
                     }
-                    else if (buf[0] != '\n') {
-                        wchar_t glyph = buf[0];
-                        if ((buf[0] & 0x80) != 0) {
-                            // utf8 character
-                            size_t n = 1;
-                            if ((buf[0] & 0xE0) == 0xC0)
-                                n = 1;
-                            else if ((buf[0] & 0xF0) == 0xE0)
-                                n = 2;
-                            else if ((buf[0] & 0xF8) == 0xF0)
-                                n = 3;
+                } else if ( !read_utf8 && (buf[0] & 0x80) != 0) {
+                    utf8_idx = 0;
+                    read_utf8 = true;
+                    utf8_size = 0;
 
-                            char utf8[n + 1];
-                            utf8[0] = buf[0];
-                            if (read(pty->master, utf8 + 1, n) <= 0) {
-                                /* This is not necessarily an error but also happens
-                             * when the child exits normally. */
-                                fprintf(stderr,
-                                        "Nothing to read from child: ");
-                                perror(NULL);
-                                return 1;
-                            }
+                    // utf8 character
+                    if ((buf[0] & 0xE0) == 0xC0)
+                        utf8_size = 2;
+                    else if ((buf[0] & 0xF0) == 0xE0)
+                        utf8_size = 3;
+                    else if ((buf[0] & 0xF8) == 0xF0)
+                        utf8_size = 4;
+                    else { exit(1); }
 
-                            glyph = utf8_to_utf32(utf8, n + 1);
-                        }
+                    utf8_buf[utf8_idx++] = buf[0];
+                } else if (read_utf8 && utf8_idx < sizeof(utf8_buf)-1) {
+                    utf8_buf[utf8_idx++] = buf[0];
+                } else {
+                    wchar_t glyph = buf[0];
 
-                        // printf("Glyph received '"); print_utf32(glyph);
-                        // printf("'\n");
-
-                        /* If this is a regular byte, store it and advance
-                     * the cursor one cell "to the right". This might
-                     * actually wrap to the next line, see below. */
-                        putch(x11, glyph);
-                        x11->buf_x++;
-
-                        if (x11->buf_x >= x11->buf_w) {
-                            x11->buf_x = 0;
-                            x11->buf_y++;
-                            just_wrapped = true;
-                        }
-                        else
-                            just_wrapped = false;
-                    }
-                    else if (!just_wrapped) {
-                        /* We read a newline and we did *not* implicitly
-                     * wrap to the next line with the last byte we read.
-                     * This means we must *now* advance to the next
-                     * line.
-                     *
-                     * This is the same behaviour that most other
-                     * terminals have: If you print a full line and then
-                     * a newline, they "ignore" that newline. (Just
-                     * think about it: A full line of text could always
-                     * wrap to the next line implicitly, so that
-                     * additional newline could cause the cursor to jump
-                     * to the next line *again*.) */
-                        x11->buf_y++;
-                        just_wrapped = false;
+                    if (read_utf8) {
+                        utf8_buf[utf8_idx++] = buf[0];
+                        read_utf8 = false;
+                        glyph = utf8_to_utf32(utf8_buf, utf8_size);
                     }
 
-                    /* We now check if "the next line" is actually outside
-                 * of the buffer. If it is, we shift the entire content
-                 * one line up and then stay in the very last line.
-                 *
-                 * After the memmove(), the last line still has the old
-                 * content. We must clear it. */
+                    read_utf8 = false;
+                    putch(x11, glyph);
+                    draw = true;
+                    x11->buf_x++;
+
+                    if (x11->buf_x >= x11->buf_w) {
+                        just_wrapped = true;
+                        add_newline = true;
+                    } else {
+                        just_wrapped = false; 
+                        add_newline = false;
+                    }
+                }
+
+                if (add_newline) {
+                    draw = true;
+                    x11->buf_x = 0;
+                    x11->buf_y++;
+                    add_newline = false;
+
                     if (x11->buf_y > x11->scr_end) {
                         size_t w = x11->buf_w;
                         for (struct cell *
@@ -1321,19 +1319,21 @@ int run(struct PTY *pty, struct X11 *x11)
                                 *source = dest + w;
                              source < x11->buf + w * (x11->scr_end + 1);
                              ++source, ++dest)
-                            copy(dest, source);
+                             copy(dest, source);
 
                         for (struct cell *dest = x11->buf + w * (x11->scr_end);
                              dest < x11->buf + w * (x11->scr_end + 1);
                              ++dest)
-                            clear(x11, dest);
+                             clear(x11, dest);
 
                         x11->buf_y = x11->scr_end;
                     }
                 }
             }
-
-            x11_redraw(x11);
+            
+            if(draw){
+                x11_redraw(x11);
+            }
         }
 
         if (FD_ISSET(x11->fd, &readable)) {
