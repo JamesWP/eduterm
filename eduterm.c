@@ -457,7 +457,7 @@ void x11_key(XKeyEvent *ev, struct PTY *pty, struct X11* x11)
     }
     else if (IsKeypad(ksym) != '\0') {
         printf("XKeyEvent arrow key\n");
-        num = snprintf(buf, sizeof(buf), "\33[[%c", IsKeypad(ksym));
+        num = snprintf(buf, sizeof(buf), "\33[%c", IsKeypad(ksym));
     }
     else {
         printf("XKeyEvent string = '%s'\n", buf);
@@ -987,8 +987,8 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                 //                        and 1048 modes.
                 //                        Use this with terminfo-based
                 //                        applications rather than the 47 mode.
-                clear_all_cells(x11);
                 switch_buffers(x11);
+                clear_all_cells(x11);
               } break;
               default:
                 exit(1);
@@ -1088,7 +1088,7 @@ int run(struct PTY *pty, struct X11 *x11)
     fd_set active;
     fd_set readable;
     XEvent ev;
-    char   _buf[1];
+    char   _buf[4096];
     char   buf[1];
     bool   just_wrapped     = false;
     bool   add_newline      = false;
@@ -1148,7 +1148,7 @@ int run(struct PTY *pty, struct X11 *x11)
 
             for (size_t i = 0; i < (size_t)num; i++) {
                 buf[0] = _buf[i];
-#if 1
+#if 0
                 char printbuf[2];
 
                 if (buf[0] >= 32 && buf[0] <= 126)
