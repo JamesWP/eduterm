@@ -1002,6 +1002,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                 //                        applications rather than the 47 mode.
                 switch_buffers(x11);
                 clear_all_cells(x11);
+                dirty_all_cells(x11);
               } break;
               default:
                 eexit(1);
