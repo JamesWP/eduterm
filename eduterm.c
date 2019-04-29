@@ -16,6 +16,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <wchar.h>
+#include <argp.h>
 
 /* Launching /bin/sh may launch a GNU Bash and that can have nasty side
  * effects. On my system, it clobbers ~/.bash_history because it doesn't
@@ -30,6 +31,8 @@ struct PTY {
 struct RGB {
     unsigned char r, g, b;
 };
+
+bool exit_mode = false;
 
 static struct RGB col_os_vals[8 + 8] = {{0, 0, 0},         // black
                                         {205, 0, 0},       // red
@@ -88,6 +91,14 @@ void copy(struct cell* dest, struct cell* source)
     
     dest->dirty = true;
 }
+
+#define eexit(i)                                          \
+    do {                                                  \
+        printf("Error file:%s, function:%s() and line:%d",\
+               __FILE__,__func__,__LINE__);               \
+        if (exit_mode) exit((i));                         \
+    } while(1);
+    
 
 struct X11 {
     int      fd;
@@ -319,7 +330,7 @@ wchar_t utf8_to_utf32(char *buf, size_t size)
         return (buf[0] & 0x07) << 18 | (buf[1] & 0x3F) << 12 |
                (buf[2] & 0x3F) << 6 | (buf[3] & 0x3F);
     else
-        exit(1);
+        eexit(1);
 }
 
 void print_utf32(wchar_t ch)
@@ -779,7 +790,8 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
       } break;
       case 'P': {
         // Delete characters
-        int num = atoi_range(buf, len - 1, 1);
+        int num = 1;
+        sscanf(buf, "%dP", &num);
         for (struct cell *source = cursor + num, *dest = cursor;
              source != lend + 1;
              ++source, ++dest)
@@ -817,7 +829,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                     x11->sgr_fg_col = x11->col_256[arg];
                 }
                 else {
-                    exit(1);
+                    eexit(1);
                 }
                 break;
               case 40:
@@ -839,7 +851,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                     x11->sgr_bg_col = x11->col_256[arg];
                 }
                 else {
-                    exit(1);
+                    eexit(1);
                 }
                 break;
               case 91:
@@ -876,7 +888,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             x11->buf_y = 0;
         }
         else {
-            exit(1);
+            eexit(1);
         }
       } break;
       case 'c': {
@@ -887,7 +899,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             (void)ignore;
         }
         else {
-            exit(1);
+            eexit(1);
         }
       } break;
       case 'C': {
@@ -907,7 +919,8 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         x11->buf_y = x11->buf_y < x11->buf_h ? x11->buf_y : x11->buf_h - 1;
       } break;
       case 'K': {
-        int arg1 = atoi_range(buf, len - 1, 0);
+        int arg1 = 0;
+        sscanf(buf, "%dK", &arg1);
         switch (arg1) {
           case 0: {
             for (struct cell *a = cursor; a != lend + 1; ++a) {
@@ -915,7 +928,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             }
           } break;
           default:
-            exit(1);
+            eexit(1);
         }
       } break;
       case 'r': {
@@ -944,13 +957,13 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             // stop cursor blinking
         }
         //else {
-        //    exit(1);
+        //    eexit(1);
         //}
       } break;
       case 'h': {
         //  CSI ? P m h   DEC Private Mode Set (DECSET)
         if (buf[0] != '?')
-            exit(1);
+            eexit(1);
 
         char *arg_s = strtok(buf+1, ";");
         while (arg_s) {
@@ -991,7 +1004,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
                 clear_all_cells(x11);
               } break;
               default:
-                exit(1);
+                eexit(1);
             }
         }
       } break;
@@ -1058,7 +1071,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
           (void) writ;
         }
         else {
-            exit(1);
+            eexit(1);
         }
       } break;
       case 't': {
@@ -1068,7 +1081,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         //      the first (and any additional parameters) are:
       } break;      	
       default: {
-        exit(1);
+        eexit(1);
       } break;
     }
 }
@@ -1197,7 +1210,7 @@ int run(struct PTY *pty, struct X11 *x11)
                         printf("Escape code unknown '%c' (%x)\n",
                                (int)buf[0],
                                (int)0xFF & buf[0]);
-                        exit(1);
+                        eexit(1);
                     }
                 }
                 else if (read_charset) {
@@ -1278,7 +1291,7 @@ int run(struct PTY *pty, struct X11 *x11)
                         utf8_size = 3;
                     else if ((buf[0] & 0xF8) == 0xF0)
                         utf8_size = 4;
-                    else { exit(1); }
+                    else { eexit(1); }
 
                     utf8_buf[utf8_idx++] = buf[0];
                 } else if (read_utf8 && utf8_idx < sizeof(utf8_buf)-1) {
@@ -1374,9 +1387,20 @@ int run(struct PTY *pty, struct X11 *x11)
 
     return 0;
 }
+const char *argp_program_version =
+  "eduterm 1.0";
+const char *argp_program_bug_address =
+  "<james_peach01@hotmail.co.uk>";
 
-int main()
+static char doc[] =
+  "Eduterm -- James' extention to the eduterm source";
+
+static struct argp argp = { 0, 0, 0, doc, 0, 0, 0 };
+
+int main(int argc, char* argv[])
 {
+    argp_parse(&argp, argc, argv, 0, 0, 0);
+
     struct PTY pty;
     struct X11 x11;
 
