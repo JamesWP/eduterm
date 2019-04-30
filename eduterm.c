@@ -33,6 +33,7 @@ struct RGB {
 };
 
 bool exit_mode = false;
+bool print_child = false;
 
 static struct RGB col_os_vals[8 + 8] = {{0, 0, 0},         // black
                                         {205, 0, 0},       // red
@@ -92,12 +93,12 @@ void copy(struct cell* dest, struct cell* source)
     dest->dirty = true;
 }
 
-#define eexit(i)                                          \
-    do {                                                  \
-        printf("Error file:%s, function:%s() and line:%d",\
-               __FILE__,__func__,__LINE__);               \
-        if (exit_mode) exit((i));                         \
-    } while(1);
+#define eexit(i)                                            \
+    do {                                                    \
+        printf("Error file:%s, function:%s() and line:%d\n",\
+               __FILE__,__func__,__LINE__);                 \
+        if (exit_mode) exit((i));                           \
+    } while(0);
     
 
 struct X11 {
@@ -331,6 +332,7 @@ wchar_t utf8_to_utf32(char *buf, size_t size)
                (buf[2] & 0x3F) << 6 | (buf[3] & 0x3F);
     else
         eexit(1);
+    return L' ';
 }
 
 void print_utf32(wchar_t ch)
@@ -379,6 +381,13 @@ void print_utf32(wchar_t ch)
     printf("%s", buf);
 }
 
+void swap(unsigned long* a, unsigned long* b)
+{
+    unsigned long tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
 void x11_redraw(struct X11 *x11)
 {
     if (!x11->cur)
@@ -391,14 +400,19 @@ void x11_redraw(struct X11 *x11)
         for (x = 0; x < x11->buf_w; x++) {
             struct cell *c = x11->buf + (y * x11->buf_w + x);
 
-            if (x != x11->buf_x || y != x11->buf_y)
-                if (!c->dirty)
-                    continue;
+            bool is_cursor = x == x11->buf_x && y == x11->buf_y;
+
+            if (!is_cursor && !c->dirty)
+                continue;
 
             total++;
-            wchar_t g = c->g;
+            wchar_t       g  = c->g;
+            unsigned long bg = c->bg;
+            unsigned long fg = c->fg;
 
-            XSetForeground(x11->dpy, x11->termgc, c->bg);
+            if (is_cursor && x11->blink) swap(&fg, &bg);
+
+            XSetForeground(x11->dpy, x11->termgc, bg);
 
             XFillRectangle(x11->dpy,
                            x11->termwin,
@@ -408,13 +422,7 @@ void x11_redraw(struct X11 *x11)
                            x11->font_width,
                            x11->font_height);
 
-#if 0
-            if (iscntrl(g)) {
-                g = ' ';
-            }
-#endif
-
-            XSetForeground(x11->dpy, x11->termgc, c->fg);
+            XSetForeground(x11->dpy, x11->termgc, fg);
 
             XwcDrawString(x11->dpy,
                           x11->termwin,
@@ -438,13 +446,6 @@ void x11_redraw(struct X11 *x11)
         XSetForeground(x11->dpy, x11->termgc, x11->col_bk);
     }
 
-    XFillRectangle(x11->dpy,
-                   x11->termwin,
-                   x11->termgc,
-                   x11->buf_x * x11->font_width,
-                   x11->buf_y * x11->font_height,
-                   x11->font_width,
-                   x11->font_height);
     XFlush(x11->dpy);
 
     // printf("Total cells drawn %d\n", (int)total);
@@ -1162,20 +1163,22 @@ int run(struct PTY *pty, struct X11 *x11)
 
             for (size_t i = 0; i < (size_t)num; i++) {
                 buf[0] = _buf[i];
-#if 0
-                char printbuf[2];
 
-                if (buf[0] >= 32 && buf[0] <= 126)
-                    printbuf[0] = buf[0];
-                else
-                    printbuf[0] = '?';
+                if (print_child) { 
+                    char printbuf[2];
 
-                printbuf[1] = '\0';
-                printf("Child sent '%s' (%d) (0x%x)\n",
-                       printbuf,
-                       (int)buf[0],
-                       (unsigned char)buf[0]);
-#endif
+                    if (buf[0] >= 32 && buf[0] <= 126)
+                        printbuf[0] = buf[0];
+                    else
+                        printbuf[0] = '?';
+
+                    printbuf[1] = '\0';
+                    printf("Child sent '%s' (%d) (0x%x)\n",
+                           printbuf,
+                           (int)buf[0],
+                           (unsigned char)buf[0]);
+                }
+
                 if (read_escape_mode) {
                     read_escape_mode = false;
                     switch (buf[0]) {
@@ -1295,7 +1298,7 @@ int run(struct PTY *pty, struct X11 *x11)
                     else { eexit(1); }
 
                     utf8_buf[utf8_idx++] = buf[0];
-                } else if (read_utf8 && utf8_idx < sizeof(utf8_buf)-1) {
+                } else if (read_utf8 && utf8_idx < utf8_size-1) {
                     utf8_buf[utf8_idx++] = buf[0];
                 } else {
                     wchar_t glyph = buf[0];
@@ -1346,6 +1349,7 @@ int run(struct PTY *pty, struct X11 *x11)
             }
             
             if(draw){
+                x11->blink = true;
                 x11_redraw(x11);
             }
         }
@@ -1396,7 +1400,34 @@ const char *argp_program_bug_address =
 static char doc[] =
   "Eduterm -- James' extention to the eduterm source";
 
-static struct argp argp = { 0, 0, 0, doc, 0, 0, 0 };
+/* The options we understand. */
+static struct argp_option options[] = {
+  {"exit-on-unknown",  'e', 0, 0, "Exit on unknown operations", 0},
+  {"print-child",  'p', 0, 0, "Print child output", 0},
+  { 0 }
+};
+
+static error_t
+parse_opt(int key, char* arg, struct argp_state *state)
+{
+  (void) arg;
+  (void) state;
+
+  switch(key) {
+    case 'e': {
+      exit_mode = true;
+    } break;
+    case 'p': {
+      print_child = true;
+    } break;
+    default:
+      return ARGP_ERR_UNKNOWN;
+  }
+  
+  return 0;
+}
+
+static struct argp argp = { options, parse_opt, 0, doc, 0, 0, 0 };
 
 int main(int argc, char* argv[])
 {
