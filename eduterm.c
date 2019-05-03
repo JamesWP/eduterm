@@ -130,6 +130,8 @@ struct X11 {
     // oldscool 3/4 bit colors, normal and bright versions
     unsigned long col_os[col_os_length];
     unsigned long col_256[256 /* duh */];
+
+    bool application_keypad;
 };
 
 void clear(struct X11 *x11, struct cell *c)
@@ -469,7 +471,10 @@ void x11_key(XKeyEvent *ev, struct PTY *pty, struct X11* x11)
     }
     else if (IsKeypad(ksym) != '\0') {
         printf("XKeyEvent arrow key\n");
-        num = snprintf(buf, sizeof(buf), "\33[%c", IsKeypad(ksym));
+        if(x11->application_keypad)
+            num = snprintf(buf, sizeof(buf), "\33O%c", IsKeypad(ksym));
+        else
+            num = snprintf(buf, sizeof(buf), "\33[%c", IsKeypad(ksym));
     }
     else {
         printf("XKeyEvent string = '%s'\n", buf);
@@ -563,6 +568,11 @@ bool x11_setup(struct X11 *x11)
                                    &default_string);
 
     XFontSetExtents* ext = XExtentsOfFontSet(x11->xfontset);
+
+    if (!ext) {
+        printf("Could not load font size\n");
+        exit(1);
+    }
 
     x11->font_width  = ext->max_logical_extent.width;
     x11->font_height = ext->max_logical_extent.height;
@@ -663,6 +673,8 @@ bool x11_setup(struct X11 *x11)
         perror("calloc");
         return false;
     }
+
+    x11->application_keypad = false;
 
     x11->scr_begin = 0;
     x11->scr_end   = x11->buf_h - 1;
@@ -904,7 +916,7 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         }
       } break;
       case 'C': {
-        int arg1 = 0;
+        int arg1 = 1;
         sscanf(buf, "%dC", &arg1);
         x11->buf_x += arg1;
         x11->buf_x = x11->buf_x < x11->buf_w - 1 ? x11->buf_x : x11->buf_w - 1;
@@ -1137,7 +1149,7 @@ int run(struct PTY *pty, struct X11 *x11)
     for (;;) {
         readable = active;
 
-        timeout.tv_sec  = 0;
+        timeout.tv_sec  = 10;
         timeout.tv_usec = 1000000;
 
         int num = select(maxfd + 1, &readable, NULL, NULL, &timeout);
@@ -1188,6 +1200,7 @@ int run(struct PTY *pty, struct X11 *x11)
                         break;
                       case '=':
                         // Application Keypad
+                        x11->application_keypad = true;
                         break;
                       case ']':
                         printf("OSI Start\n");
@@ -1203,6 +1216,7 @@ int run(struct PTY *pty, struct X11 *x11)
                         }
                         break;
                       case '>': {  //  Normal Keypad (DECPNM)
+                        x11->application_keypad = false;
                       } break;
                       case '(': {
                         //  ESC ( C   Designate G0 Character Set (ISO 2022)
