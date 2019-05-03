@@ -365,15 +365,18 @@ void print_utf32(wchar_t ch)
     target += len;
 
     switch (len) { /* note: everything falls through. */
-      case 4:
+      case 4: 
         *--target = (char)((ch | byteMark) & byteMask);
         ch >>= 6;
+        __attribute__((fallthrough));
       case 3:
         *--target = (char)((ch | byteMark) & byteMask);
         ch >>= 6;
+        __attribute__((fallthrough));
       case 2:
         *--target = (char)((ch | byteMark) & byteMask);
         ch >>= 6;
+        __attribute__((fallthrough));
       case 1:
         *--target = (char)(ch | firstByteMark[len]);
     }
@@ -973,6 +976,9 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
         //    eexit(1);
         //}
       } break;
+      case 's':  
+        buf[len] = 'h';
+        __attribute__((fallthrough));
       case 'h': {
         //  CSI ? P m h   DEC Private Mode Set (DECSET)
         if (buf[0] != '?')
@@ -1106,6 +1112,8 @@ void process_osi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
     (void)x11;
     (void)pty;
 
+    for(char*a = buf; *a!= 0;++a) if(!isprint(*a)) *a = '?';
+
     printf("Osi received '%s'\n", buf);
 }
 
@@ -1149,7 +1157,7 @@ int run(struct PTY *pty, struct X11 *x11)
     for (;;) {
         readable = active;
 
-        timeout.tv_sec  = 10;
+        timeout.tv_sec  = 0;
         timeout.tv_usec = 1000000;
 
         int num = select(maxfd + 1, &readable, NULL, NULL, &timeout);
@@ -1267,11 +1275,15 @@ int run(struct PTY *pty, struct X11 *x11)
                     osi_buf[osi_buf_i] = buf[0];
                     osi_buf_i++;
                     if (is_final_osi_byte(buf[0])) {
-                        osi_buf[osi_buf_i] = '\0';
+                        osi_buf[osi_buf_i-1] = '\0';
                         process_osi(osi_buf, osi_buf_i - 1, x11, pty);
                         read_osi = false;
                         draw = true;
                     }
+                }
+                else if (buf[0] == '\t') {
+                    x11->buf_x += 8 - (x11->buf_x&7);
+                    draw = true;
                 }
                 else if (buf[0] == '\r') {
                     /* "Carriage returns" are probably the most simple
