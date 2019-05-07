@@ -64,6 +64,8 @@ struct cell {
     wchar_t       g;
     unsigned long fg;
     unsigned long bg;
+    bool          bold;
+    bool          italic;
     bool          dirty;
 };
 
@@ -78,6 +80,10 @@ bool equals(struct cell* a, struct cell* b)
     if (a->fg != b->fg)
         return false;
     if (a->bg != b->bg)
+        return false;
+    if (a->bold != b->bold)
+        return false;
+    if (a->italic != b->italic)
         return false;
     
     return true;
@@ -113,6 +119,8 @@ struct X11 {
     int           w, h;
 
     XFontSet     xfontset;
+    XFontSet     xboldfontset;
+    XFontSet     xitalicfontset;
     int          font_width, font_height, font_yadg;
 
     struct cell *buf_alt;
@@ -126,6 +134,8 @@ struct X11 {
 
     unsigned long sgr_fg_col;
     unsigned long sgr_bg_col;
+    bool          sgr_bold;
+    bool          sgr_italic;
 
     // oldscool 3/4 bit colors, normal and bright versions
     unsigned long col_os[col_os_length];
@@ -141,6 +151,8 @@ void clear(struct X11 *x11, struct cell *c)
     c->g     = L' ';
     c->fg    = x11->col_fg;
     c->bg    = x11->col_bg;
+    c->bold  = false;
+    c->italic = false;
 
     c->dirty |= !equals(&backup, c);
 }
@@ -158,6 +170,8 @@ void putch(struct X11 *x11, wchar_t g)
     c->g     = g;
     c->fg    = x11->sgr_fg_col;
     c->bg    = x11->sgr_bg_col;
+    c->bold  = x11->sgr_bold;
+    c->italic  = x11->sgr_italic;
     c->dirty = true;
 }
 
@@ -414,6 +428,8 @@ void x11_redraw(struct X11 *x11)
             wchar_t       g  = c->g;
             unsigned long bg = c->bg;
             unsigned long fg = c->fg;
+            bool          bold = c->bold;
+            bool          italic = c->italic;
 
             if (is_cursor && x11->blink) swap(&fg, &bg);
 
@@ -429,14 +445,34 @@ void x11_redraw(struct X11 *x11)
 
             XSetForeground(x11->dpy, x11->termgc, fg);
 
-            XwcDrawString(x11->dpy,
-                          x11->termwin,
-                          x11->xfontset,
-                          x11->termgc,
-                          x * x11->font_width,
-                          y * x11->font_height + x11->font_yadg,
-                          &g,
-                          1);
+            if (bold) {
+                XwcDrawString(x11->dpy,
+                              x11->termwin,
+                              x11->xboldfontset,
+                              x11->termgc,
+                              x * x11->font_width,
+                              y * x11->font_height + x11->font_yadg,
+                              &g,
+                              1);
+            } else if (italic) {
+                XwcDrawString(x11->dpy,
+                              x11->termwin,
+                              x11->xitalicfontset,
+                              x11->termgc,
+                              x * x11->font_width,
+                              y * x11->font_height + x11->font_yadg,
+                              &g,
+                              1);
+            } else {
+                XwcDrawString(x11->dpy,
+                              x11->termwin,
+                              x11->xfontset,
+                              x11->termgc,
+                              x * x11->font_width,
+                              y * x11->font_height + x11->font_yadg,
+                              &g,
+                              1);
+            }
 
             if (x == x11->buf_x && y == x11->buf_y)
                 c->dirty = true;
@@ -454,6 +490,63 @@ void x11_redraw(struct X11 *x11)
     XFlush(x11->dpy);
 
     // printf("Total cells drawn %d\n", (int)total);
+}
+
+char ascii_char(const struct cell* c)
+{
+    if (iswspace(c->g))
+        return ' ';
+    else if (iswcntrl(c->g))
+        return ' ';
+    else if (iswcntrl(c->g))
+        return ' ';
+    else if (iswprint(c->g))
+        return c->g;
+    else
+        return '?';
+}
+
+char bold_char(const struct cell* c)
+{
+    if (c->bold)
+        return '!';
+    else
+        return ' ';
+}
+char italic_char(const struct cell* c)
+{
+    if (c->italic)
+        return '!';
+    else
+        return ' ';
+}
+
+void print_screen(struct X11* x11, char(*cell_val)(const struct cell *c))
+{
+    printf("\n");
+    char row[x11->buf_w + 1];
+    row[x11->buf_w] = '\0';
+
+    for (int x = 0; x < x11->buf_w; x++)
+        row[x] = '_';
+
+    printf(" . %s . \n", row);
+
+    for(int y=0;y<x11->buf_h; y++){
+        for (int x = 0; x < x11->buf_w; x++) {
+            const struct cell *c = x11->buf + (x11->buf_w * y + x);
+
+            row[x] = cell_val(c);
+        }
+        printf(" | %s | \n", row);
+    }
+
+    for (int x = 0; x < x11->buf_w; x++)
+        row[x] = '-';
+
+    printf(" ` %s ` \n", row);
+
+    printf("\n");
 }
 
 void x11_key(XKeyEvent *ev, struct PTY *pty, struct X11* x11)
@@ -490,38 +583,9 @@ void x11_key(XKeyEvent *ev, struct PTY *pty, struct X11* x11)
         x11_redraw(x11);
       } break;
       case XK_Insert: {
-        printf("\n");
-        char row[x11->buf_w + 1];
-        row[x11->buf_w] = '\0';
-
-        for (int x = 0; x < x11->buf_w; x++)
-            row[x] = '_';
-
-        printf(" . %s . \n", row);
-
-        for(int y=0;y<x11->buf_h; y++){
-            for (int x = 0; x < x11->buf_w; x++) {
-                struct cell *c = x11->buf + (x11->buf_w * y + x);
-                if (iswspace(c->g))
-                    row[x] = ' ';
-                else if (iswcntrl(c->g))
-                    row[x] = ' ';
-                else if (iswcntrl(c->g))
-                    row[x] = ' ';
-                else if (iswprint(c->g))
-                    row[x] = c->g;
-                else
-                    row[x] = '?';
-            }
-            printf(" | %s | \n", row);
-        }
-
-        for (int x = 0; x < x11->buf_w; x++)
-            row[x] = '-';
-
-        printf(" ` %s ` \n", row);
-
-        printf("\n");
+        print_screen(x11, bold_char);
+        print_screen(x11, italic_char);
+        print_screen(x11, ascii_char);
       } break;
       default: {
         int ignore = write(pty->master, buf, num);
@@ -570,6 +634,22 @@ bool x11_setup(struct X11 *x11)
                                    &num_missing_charsets,
                                    &default_string);
 
+    font = "-*-fixed-bold-r-normal-*-13-*-*-*-*-*-*-1";
+
+    x11->xboldfontset = XCreateFontSet(x11->dpy,
+                                       font,
+                                       &missing_charsets,
+                                       &num_missing_charsets,
+                                       &default_string);
+
+    font = "-*-fixed-*-o-*-*-13-*-*-*-*-*-*-1";
+
+    x11->xitalicfontset = XCreateFontSet(x11->dpy,
+                                         font,
+                                         &missing_charsets,
+                                         &num_missing_charsets,
+                                         &default_string);
+
     XFontSetExtents* ext = XExtentsOfFontSet(x11->xfontset);
 
     if (!ext) {
@@ -597,6 +677,7 @@ bool x11_setup(struct X11 *x11)
     x11->col_fg     = color.pixel;
     x11->sgr_fg_col = x11->col_fg;
     x11->sgr_bg_col = x11->col_bg;
+    x11->sgr_bold   = false;
 
     if (!XAllocNamedColor(x11->dpy, cmap, "#444444", &color, &color)) {
         fprintf(stderr, "Could not load blink color\n");
@@ -804,6 +885,15 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
             clear(x11, bend);
 
       } break;
+      case 'B':
+      case 'A': {
+        int num = 1;
+        sscanf(buf, "%d", &num);
+        bool up = buf[num-1] == 'A';
+        x11->buf_y += (up ? -1 : 1) * num;
+        x11->buf_y = x11->buf_y > x11->buf_h - 1 ? x11->buf_h - 1 : x11->buf_y;
+        x11->buf_y = x11->buf_y < 0 ? 0 : x11->buf_y;
+      } break;
       case 'P': {
         // Delete characters
         int num = 1;
@@ -825,6 +915,14 @@ void process_csi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
               case 0:
                 x11->sgr_fg_col = x11->col_fg;
                 x11->sgr_bg_col = x11->col_bg;
+                x11->sgr_bold = false;
+                x11->sgr_italic = false;
+                break;
+              case 1:
+                x11->sgr_bold = true;
+                break;
+              case 3:
+                x11->sgr_italic = true;
                 break;
               case 30:
               case 31:
