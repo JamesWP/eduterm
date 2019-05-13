@@ -1330,6 +1330,17 @@ int run(struct PTY *pty, struct X11 *x11)
                       } break;
                       case '7': {  // save cursor
                       } break;
+                      case 'M': {
+                        // move cursor up, if cursor at top, scroll screen
+                        if (x11->buf_y==0) {
+                            // scroll window content down one row
+                            process_csi("L", 0, x11, pty);
+                        } else {
+                            // move cursor up
+                            --x11->buf_y;
+                        }
+                        draw = true;
+                      } break;
                       default:
                         printf("Escape code unknown '%c' (%x)\n",
                                (int)buf[0],
@@ -1367,6 +1378,7 @@ int run(struct PTY *pty, struct X11 *x11)
                         process_csi(csi_buf, csi_buf_i - 1, x11, pty);
                         read_csi = false;
                         draw = true;
+                        just_wrapped = false; 
                     }
                 }
                 else if (read_osi) {
@@ -1406,6 +1418,8 @@ int run(struct PTY *pty, struct X11 *x11)
                     if (!just_wrapped) { 
                         add_newline = true; 
                         draw = true; 
+                    } else {
+                        printf("Supressed double newline\n");
                     }
                 } else if ( !read_utf8 && (buf[0] & 0x80) != 0) {
                     utf8_idx = 0;
@@ -1448,6 +1462,7 @@ int run(struct PTY *pty, struct X11 *x11)
                 }
 
                 if (add_newline) {
+                    printf("Adding newline\n");
                     draw = true;
                     x11->buf_x = 0;
                     x11->buf_y++;
