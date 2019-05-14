@@ -560,7 +560,8 @@ void x11_key(XKeyEvent *ev, struct PTY *pty, struct X11* x11)
 
     if (IsTtyFunctionOrSpaceKey(ksym)) {
         printf("XKeyEvent non character = (%x) len() == %d\n", 0xFF & buf[0], num);
-        if(buf[0] == '\177'){
+        if(ksym == XK_BackSpace){
+            printf("XBackspace \n");
             // backspace
             num = snprintf(buf, sizeof(buf), "\33[3~");
         }
@@ -1215,6 +1216,21 @@ void process_osi(char *buf, size_t len, struct X11 *x11, struct PTY *pty)
     printf("Osi received '%s'\n", buf);
 }
 
+void scroll_up(struct X11 *x11)
+{
+    size_t w = x11->buf_w;
+    for (struct cell *dest   = x11->buf + (w * x11->scr_begin),
+                     *source = dest + w;
+         source < x11->buf + w * (x11->scr_end + 1);
+         ++source, ++dest)
+        copy(dest, source);
+
+    for (struct cell *dest = x11->buf + w * (x11->scr_end);
+         dest < x11->buf + w * (x11->scr_end + 1);
+         ++dest)
+        clear(x11, dest);
+}
+
 int run(struct PTY *pty, struct X11 *x11)
 {
     int    maxfd;
@@ -1447,6 +1463,17 @@ int run(struct PTY *pty, struct X11 *x11)
                         glyph = utf8_to_utf32(utf8_buf, utf8_size);
                     }
 
+                    if (just_wrapped) {
+                        just_wrapped = false;
+                        x11->buf_x   = 0;
+                        if (x11->buf_y > x11->scr_end) {
+                            scroll_up(x11);
+                            x11->buf_y = x11->scr_end;
+                        } else {
+                            ++x11->buf_y;
+                        }
+                    }
+
                     read_utf8 = false;
                     putch(x11, glyph);
                     draw = true;
@@ -1454,34 +1481,19 @@ int run(struct PTY *pty, struct X11 *x11)
 
                     if (x11->buf_x >= x11->buf_w) {
                         just_wrapped = true;
-                        add_newline = true;
-                    } else {
-                        just_wrapped = false; 
-                        add_newline = false;
+                        x11->buf_x = x11->buf_w-1;
                     }
                 }
 
                 if (add_newline) {
-                    printf("Adding newline\n");
+                    add_newline = false;
                     draw = true;
+                    printf("Adding newline\n");
                     x11->buf_x = 0;
                     x11->buf_y++;
-                    add_newline = false;
 
                     if (x11->buf_y > x11->scr_end) {
-                        size_t w = x11->buf_w;
-                        for (struct cell *
-                                 dest   = x11->buf + (w * x11->scr_begin),
-                                *source = dest + w;
-                             source < x11->buf + w * (x11->scr_end + 1);
-                             ++source, ++dest)
-                             copy(dest, source);
-
-                        for (struct cell *dest = x11->buf + w * (x11->scr_end);
-                             dest < x11->buf + w * (x11->scr_end + 1);
-                             ++dest)
-                             clear(x11, dest);
-
+                        scroll_up(x11);
                         x11->buf_y = x11->scr_end;
                     }
                 }
